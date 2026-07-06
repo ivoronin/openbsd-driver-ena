@@ -125,24 +125,24 @@ CTASSERT(sizeof(struct ena_tx_cdesc) == 8);
 #define ENA_TX_STUCK_TIMEOUT	3
 
 /*
- * LLQ geometry, negotiated in ena_llq_negotiate(): 128-byte entries,
- * two descriptor slots (meta + first data) in front of up to 96
- * pushed header bytes; continuation entries carry 8 descriptors each.
+ * LLQ geometry.  The entry size is negotiated in ena_llq_negotiate():
+ * 128 bytes, or wide 256-byte entries when the device recommends them
+ * (Nitro v5 and later require that in practice).  Two descriptor
+ * slots (meta + first data) sit in front of the pushed header;
+ * continuation entries carry entry_size / 16 descriptors.
  */
-#define ENA_LLQ_ENTRY_SIZE	128
+#define ENA_LLQ_ENTRY_MIN	128
+#define ENA_LLQ_ENTRY_MAX	256
 #define ENA_LLQ_DESCS_BEFORE_HDR 2
-#define ENA_LLQ_DESCS_PER_ENTRY	(ENA_LLQ_ENTRY_SIZE / \
-				 sizeof(struct ena_tx_desc))
 #define ENA_LLQ_HDR_OFF		(ENA_LLQ_DESCS_BEFORE_HDR * \
 				 sizeof(struct ena_tx_desc))
-#define ENA_LLQ_HDR_SPACE	(ENA_LLQ_ENTRY_SIZE - ENA_LLQ_HDR_OFF)
 
 /* Admin/reset polling: exponential backoff between register reads. */
 #define ENA_POLL_MIN_US		100
 #define ENA_POLL_MAX_US		5000
 #define ENA_AQ_TIMEOUT_US	3000000	/* if CAPS doesn't say better */
 
-#define ENA_DRIVER_VERSION	0x00000001	/* 1.0.0 */
+#define ENA_DRIVER_VERSION	0x00000002	/* 2.0.0 */
 
 struct ena_dmamem {
 	bus_dmamap_t		 edm_map;
@@ -166,7 +166,11 @@ struct ena_rx_slot {
 
 /*
  * RX ring pair: the SQ hands buffers to the device, the CQ describes
- * received packets.  req_id of a buffer is its slot index.  The
+ * received packets.  req_ids are drawn from rxr_ids, a ring of free
+ * ids: the device returns buffers in an order of its own choosing, so
+ * a buffer's id cannot be tied to the SQ position it was posted at.
+ * Ids leave the ring at rxr_prod and return at rxr_cons; completions
+ * always trail fills, so the two never touch the same entry.  The
  * producer side (rxr_prod, refill) is serialized by rxr_mtx; the
  * consumer side runs only from the IO interrupt.
  */
@@ -178,6 +182,7 @@ struct ena_rxr {
 	struct ena_dmamem	 rxr_sq_ring;
 	struct ena_dmamem	 rxr_cq_ring;
 	struct ena_rx_slot	*rxr_slots;
+	uint16_t		*rxr_ids;
 	unsigned int		 rxr_ndescs;
 	uint16_t		 rxr_prod;
 	uint16_t		 rxr_cons;
@@ -203,6 +208,9 @@ struct ena_tx_slot {
  * ifq, the consumer side (ena_txeof) from the IO interrupt; the number
  * of outstanding SQ descriptors is the atomically maintained txr_used.
  * req_id of a packet is the slot index of its first descriptor.
+ * Unlike RX there is no free-id ring: ena_start() refuses to reuse a
+ * slot whose packet is still outstanding, so an out-of-order
+ * completion costs waiting, never a corrupted slot.
  */
 struct ena_txr {
 	struct ena_softc	*txr_sc;
@@ -261,6 +269,7 @@ struct ena_softc {
 	unsigned int		 sc_aq_timeout_us;
 
 	struct ena_dmamem	 sc_hostinfo;
+	struct ena_dmamem	 sc_mmio_resp;
 
 	/* AENQ; the ring is consumed by sc_aenq_task on systq. */
 	struct ena_dmamem	 sc_aenq_ring;
@@ -277,9 +286,6 @@ struct ena_softc {
 
 	/* Written by the AENQ task, read by the watchdog tick. */
 	time_t			 sc_keepalive_ts;
-	/* Device-side drops from keepalive events; kstat is post-MVP. */
-	uint64_t		 sc_rx_drops;
-	uint64_t		 sc_tx_drops;
 	struct timeout		 sc_watchdog_tmo;
 
 	/* Recovery runs as a task on systq, like the AENQ handler. */
@@ -331,6 +337,7 @@ struct ena_softc {
 
 	/* LLQ negotiation results. */
 	int			 sc_llq_on;
+	unsigned int		 sc_llq_entry_size; /* 128 or wide 256 */
 	int			 sc_llq_meta;	/* meta desc per packet */
 	unsigned int		 sc_llq_burst;	/* entries/doorbell, 0=inf */
 	uint32_t		 sc_llq_max_depth; /* TX entries in LLQ mode */
@@ -376,6 +383,7 @@ ena_wr_base(struct ena_softc *sc, bus_size_t lo, bus_addr_t dva)
 static int	ena_match(struct device *, void *, void *);
 static void	ena_attach(struct device *, struct device *, void *);
 static int	ena_detach(struct device *, int);
+static int	ena_msix_bar_assign(struct pci_attach_args *);
 
 static int	ena_dev_reset(struct ena_softc *, int);
 static int	ena_reset_wait(struct ena_softc *, uint32_t, uint32_t,
@@ -386,7 +394,7 @@ static int	ena_dmamem_alloc(struct ena_softc *, struct ena_dmamem *,
 static void	ena_dmamem_free(struct ena_softc *, struct ena_dmamem *);
 
 static int	ena_aq_alloc(struct ena_softc *);
-static void	ena_aq_hwinit(struct ena_softc *);
+static void	ena_admin_init(struct ena_softc *);
 static void	ena_aq_fini(struct ena_softc *);
 static int	ena_aq_exec(struct ena_softc *, union ena_aq_cmd *,
 		    struct ena_acq_desc *);
@@ -398,8 +406,7 @@ static int	ena_aq_set_feature(struct ena_softc *, uint8_t, uint8_t,
 static int	ena_get_device_attributes(struct ena_softc *, uint8_t *);
 static int	ena_get_queue_limits(struct ena_softc *);
 static int	ena_dev_init(struct ena_softc *, int, uint8_t *);
-static void	ena_hostinfo_init(struct ena_softc *,
-		    struct pci_attach_args *);
+static void	ena_hostinfo_init(struct ena_softc *);
 static void	ena_hostinfo_set(struct ena_softc *);
 
 static int	ena_aq_create_cq(struct ena_softc *, unsigned int,
@@ -436,7 +443,8 @@ static void	ena_txeof(struct ena_txr *);
 static int	ena_txr_stalled(struct ena_txr *);
 
 static int	ena_aenq_alloc(struct ena_softc *);
-static int	ena_aenq_hwinit(struct ena_softc *);
+static void	ena_aenq_register(struct ena_softc *);
+static int	ena_aenq_negotiate(struct ena_softc *);
 static void	ena_aenq_fini(struct ena_softc *);
 static void	ena_aenq_arm(struct ena_softc *);
 static void	ena_aenq_task(void *);
@@ -479,6 +487,45 @@ ena_match(struct device *parent, void *match, void *aux)
 	return (pci_matchbyid(aux, ena_devices, nitems(ena_devices)));
 }
 
+/*
+ * The MSI-X table lives in a BAR this driver never maps for its own
+ * use, and OpenBSD assigns BARs lazily, as drivers map them - so when
+ * the platform firmware leaves the table BAR unprogrammed (seen on
+ * amd64 EC2 instances), nobody else gives it an address, and amd64's
+ * pci_msix_table_map() maps whatever the BAR says without assigning
+ * it first: the vectors land nowhere and interrupts are silently
+ * lost.  arm64 closes this gap in _pci_intr_map_msix(); this helper
+ * closes it for amd64 and duplicates harmlessly elsewhere.
+ */
+static int
+ena_msix_bar_assign(struct pci_attach_args *pa)
+{
+	pci_chipset_tag_t pc = pa->pa_pc;
+	pcitag_t tag = pa->pa_tag;
+	pcireg_t table, type;
+	int off, bir, bar;
+
+	/*
+	 * Mirror the gate in pci_intr_map_msix(): if MSI is off for
+	 * this bus, MSI-X will never be established, while the
+	 * pci_mapreg_assign() below would still flip MEM and MASTER
+	 * enable on - so leave the device alone on a path that can
+	 * never use it.
+	 */
+	if (!ISSET(pa->pa_flags, PCI_FLAGS_MSI_ENABLED))
+		return (ENXIO);
+
+	if (pci_get_capability(pc, tag, PCI_CAP_MSIX, &off, NULL) == 0)
+		return (ENXIO);
+
+	table = pci_conf_read(pc, tag, off + PCI_MSIX_TABLE);
+	bir = table & PCI_MSIX_TABLE_BIR;
+	bar = PCI_MAPREG_START + bir * 4;
+	type = pci_mapreg_type(pc, tag, bar);
+
+	return (pci_mapreg_assign(pa, bar, type, NULL, NULL));
+}
+
 static void
 ena_attach(struct device *parent, struct device *self, void *aux)
 {
@@ -516,15 +563,24 @@ ena_attach(struct device *parent, struct device *self, void *aux)
 	}
 
 	/*
-	 * The prefetchable BAR is the LLQ window; pci_mapreg_map()
-	 * turns the prefetchable bit into a write-combining mapping.
-	 * Missing window simply means host mode.
+	 * The prefetchable BAR is the LLQ window and must be mapped
+	 * write-combining: the device latches LLQ entries at burst
+	 * granularity, so pushing them as individual device-memory
+	 * stores hands it a partial entry (correct descriptors, stale
+	 * payload).  Missing window simply means host mode.
 	 */
 	memtype = pci_mapreg_type(pa->pa_pc, pa->pa_tag, ENA_PCI_BAR2);
-	if (pci_mapreg_map(pa, ENA_PCI_BAR2, memtype, BUS_SPACE_MAP_LINEAR,
+	if (pci_mapreg_map(pa, ENA_PCI_BAR2, memtype,
+	    BUS_SPACE_MAP_LINEAR | BUS_SPACE_MAP_PREFETCHABLE,
 	    &sc->sc_llq_memt, &sc->sc_llq_memh, NULL,
 	    &sc->sc_llq_mems, 0) != 0)
 		sc->sc_llq_mems = 0;
+
+	/* ENA is MSI-X only; make sure the vector table BAR is backed. */
+	if (ena_msix_bar_assign(pa) != 0) {
+		printf(": unable to assign MSI-X table BAR\n");
+		goto unmap;
+	}
 
 	ver = ena_rd(sc, ENA_VERSION);
 	caps = ena_rd(sc, ENA_CAPS);
@@ -543,6 +599,11 @@ ena_attach(struct device *parent, struct device *self, void *aux)
 		printf(": unable to allocate event queue\n");
 		goto free_aq;
 	}
+	if (ena_dmamem_alloc(sc, &sc->sc_mmio_resp, PAGE_SIZE,
+	    PAGE_SIZE) != 0) {
+		printf(": unable to allocate mmio response region\n");
+		goto free_aenq;
+	}
 
 	/*
 	 * The host info page is filled once here and handed over by
@@ -550,7 +611,7 @@ ena_attach(struct device *parent, struct device *self, void *aux)
 	 * based on it and old versions refused to create completion
 	 * queues without it.  Allocation failure is not fatal.
 	 */
-	ena_hostinfo_init(sc, pa);
+	ena_hostinfo_init(sc);
 
 	if (ena_dev_init(sc, ENA_RESET_NORMAL, enaddr) != 0) {
 		printf(": device init failed\n");
@@ -585,13 +646,19 @@ ena_attach(struct device *parent, struct device *self, void *aux)
 	}
 
 	printf(": v%u.%u, %s%s, address %s\n", ENA_VERSION_MAJOR(ver),
-	    ENA_VERSION_MINOR(ver), intrstr, sc->sc_llq_on ? ", llq" : "",
+	    ENA_VERSION_MINOR(ver), intrstr, sc->sc_llq_on ?
+	    (sc->sc_llq_entry_size == ENA_LLQ_ENTRY_MAX ?
+	    ", llq wide" : ", llq") : "",
 	    ether_sprintf(sc->sc_ac.ac_enaddr));
 
 	ifp->if_softc = sc;
 	strlcpy(ifp->if_xname, DEVNAME(sc), IFNAMSIZ);
 	ifp->if_flags = IFF_BROADCAST | IFF_SIMPLEX | IFF_MULTICAST;
-	ifp->if_xflags = IFXF_MPSAFE | IFXF_MBUF_64BIT;
+	/*
+	 * When porting to 8.0, OR in IFXF_MBUF_64BIT here: the device
+	 * handles 64-bit DMA addresses, but the 7.9 tree lacks the flag.
+	 */
+	ifp->if_xflags = IFXF_MPSAFE;
 	ifp->if_ioctl = ena_ioctl;
 	ifp->if_qstart = ena_start;
 	/*
@@ -621,6 +688,8 @@ shutdown:
 	ena_dev_reset(sc, ENA_RESET_SHUTDOWN);
 	if (ENA_DMA_LEN(&sc->sc_hostinfo) != 0)
 		ena_dmamem_free(sc, &sc->sc_hostinfo);
+	ena_dmamem_free(sc, &sc->sc_mmio_resp);
+free_aenq:
 	ena_aenq_fini(sc);
 free_aq:
 	ena_aq_fini(sc);
@@ -671,6 +740,7 @@ ena_detach(struct device *self, int flags)
 	ena_aenq_fini(sc);
 	if (ENA_DMA_LEN(&sc->sc_hostinfo) != 0)
 		ena_dmamem_free(sc, &sc->sc_hostinfo);
+	ena_dmamem_free(sc, &sc->sc_mmio_resp);
 	ena_aq_fini(sc);
 	if (sc->sc_llq_mems != 0) {
 		bus_space_unmap(sc->sc_llq_memt, sc->sc_llq_memh,
@@ -811,13 +881,22 @@ ena_aq_alloc(struct ena_softc *sc)
 }
 
 /*
- * Program the admin rings into the device.  Also the second half of
+ * Program the control rings into the device.  Also the second half of
  * recovery: after a device reset the rings are re-registered as they
- * are, only the driver-side state needs rewinding.
+ * are, only the driver-side state needs rewinding.  The AENQ ring is
+ * part of this handshake on purpose; see ena_aenq_register().
  */
 static void
-ena_aq_hwinit(struct ena_softc *sc)
+ena_admin_init(struct ena_softc *sc)
 {
+	/*
+	 * Hand over the response region for readless register reads
+	 * first; a reset clears it.  This driver reads its registers
+	 * directly, but a device that was never handed a valid region
+	 * silently drops later admin operations.
+	 */
+	ena_wr_base(sc, ENA_MMIO_RESP_LO, ENA_DMA_DVA(&sc->sc_mmio_resp));
+
 	sc->sc_aq_prod = 0;
 	sc->sc_aq_phase = 1;
 	sc->sc_acq_cons = 0;
@@ -840,6 +919,8 @@ ena_aq_hwinit(struct ena_softc *sc)
 	/* Writing ACQ_CAPS is what arms the admin queue. */
 	ena_wr(sc, ENA_ACQ_CAPS,
 	    ENA_RING_CAPS(ENA_AQ_NUM, sizeof(struct ena_acq_desc)));
+
+	ena_aenq_register(sc);
 }
 
 static void
@@ -891,8 +972,6 @@ ena_aq_opcode_str(uint8_t opcode)
 		return ("GET_FEATURE");
 	case ENA_AQ_OP_SET_FEATURE:
 		return ("SET_FEATURE");
-	case ENA_AQ_OP_GET_STATS:
-		return ("GET_STATS");
 	default:
 		return ("unknown");
 	}
@@ -1208,9 +1287,10 @@ ena_get_queue_limits(struct ena_softc *sc)
 	/* Clamp the device facts to what the data path can actually use. */
 	if (sc->sc_max_tx_segs == 0 || sc->sc_max_tx_segs > ENA_TX_NSEGS)
 		sc->sc_max_tx_segs = ENA_TX_NSEGS;
-	/* Zero means "no hint"; either way our LLQ entry is the cap. */
-	if (sc->sc_tx_max_hdr == 0 || sc->sc_tx_max_hdr > ENA_LLQ_HDR_SPACE)
-		sc->sc_tx_max_hdr = ENA_LLQ_HDR_SPACE;
+	/*
+	 * sc_tx_max_hdr is clamped in ena_llq_negotiate() once the
+	 * entry size, and with it the inline header space, is known.
+	 */
 
 	/* Absurd limits would corrupt the ring math further down. */
 	if (sc->sc_max_tx_sq_depth < ENA_NDESCS_MIN ||
@@ -1223,10 +1303,11 @@ ena_get_queue_limits(struct ena_softc *sc)
 /*
  * Bring the device from freshly-reset to a ready (but still masked)
  * control plane.  This is the single ladder both attach and recovery
- * climb: reset with an honest reason, re-register the admin rings,
- * hand over host info, re-read device facts and limits, renegotiate
- * LLQ, re-arm the event machinery.  The caller owns applying the MAC
- * address and unmasking interrupts at its right moment.
+ * climb: reset with an honest reason, re-register the control rings
+ * (admin and event), hand over host info, re-read device facts and
+ * limits, renegotiate LLQ, re-subscribe the event groups.  The caller
+ * owns applying the MAC address and unmasking interrupts at its right
+ * moment.
  */
 static int
 ena_dev_init(struct ena_softc *sc, int reason, uint8_t *enaddr)
@@ -1239,7 +1320,18 @@ ena_dev_init(struct ena_softc *sc, int reason, uint8_t *enaddr)
 	if (error != 0)
 		return (error);
 
-	ena_aq_hwinit(sc);
+	/*
+	 * The reset returned the device to host-memory TX placement:
+	 * the LLQ commitment died with it and must not outlive it, or
+	 * a queue created against the stale state breaks TX silently.
+	 * ena_llq_negotiate() re-commits further down the ladder.
+	 */
+	sc->sc_llq_on = 0;
+	sc->sc_llq_meta = 0;
+	sc->sc_llq_burst = 0;
+	sc->sc_llq_entry_size = 0;
+
+	ena_admin_init(sc);
 	ena_hostinfo_set(sc);
 
 	error = ena_get_device_attributes(sc, enaddr);
@@ -1264,7 +1356,7 @@ ena_dev_init(struct ena_softc *sc, int reason, uint8_t *enaddr)
 	sc->sc_tx_ndescs = 1U << (fls(MIN(ENA_NDESCS_MAX, tx_cap)) - 1);
 	sc->sc_rx_buf_len = MCLBYTES;
 
-	return (ena_aenq_hwinit(sc));
+	return (ena_aenq_negotiate(sc));
 }
 
 /*
@@ -1278,19 +1370,18 @@ ena_dev_init(struct ena_softc *sc, int reason, uint8_t *enaddr)
 static void
 ena_llq_negotiate(struct ena_softc *sc)
 {
-	struct ena_feat_llq llq;
-	unsigned int burst = 0;
+	struct ena_feat_llq llq, set;
+	unsigned int esize;
+	uint32_t depth;
+	uint16_t esize_bit, accel;
 	int meta;
 
 	/*
-	 * Host mode is the default; LLQ state is computed into locals
-	 * and committed to the softc only on full success, so no bail
-	 * path can leave a half-configured mode behind.
+	 * The LLQ state was already invalidated at the reset; it is
+	 * computed into locals and committed to the softc only on full
+	 * success, so no bail path can leave a half-configured mode
+	 * behind and host mode remains the default.
 	 */
-	sc->sc_llq_on = 0;
-	sc->sc_llq_meta = 0;
-	sc->sc_llq_burst = 0;
-
 	if (sc->sc_llq_mems == 0 ||
 	    !ISSET(sc->sc_supported_features, 1U << ENA_FEAT_LLQ))
 		return;
@@ -1299,8 +1390,6 @@ ena_llq_negotiate(struct ena_softc *sc)
 		return;
 
 	if (!ISSET(lemtoh16(&llq.efl_hdr_supported), ENA_LLQ_HDR_INLINE) ||
-	    !ISSET(lemtoh16(&llq.efl_entry_size_supported),
-	    ENA_LLQ_ENTRY_128) ||
 	    !ISSET(lemtoh16(&llq.efl_descs_before_hdr_supported),
 	    ENA_LLQ_TWO_DESCS_BEFORE_HDR) ||
 	    !ISSET(lemtoh16(&llq.efl_stride_supported),
@@ -1309,65 +1398,102 @@ ena_llq_negotiate(struct ena_softc *sc)
 		return;
 	}
 
-	meta = ISSET(lemtoh16(&llq.efl_accel_flags),
-	    ENA_LLQ_ACCEL_DISABLE_META_CACHING);
-	if (ISSET(lemtoh16(&llq.efl_accel_flags),
-	    ENA_LLQ_ACCEL_LIMIT_TX_BURST)) {
-		burst = lemtoh16(&llq.efl_accel_burst) / ENA_LLQ_ENTRY_SIZE;
-		/* A budget below one multi-entry packet is unusable. */
-		if (burst < 2)
-			return;
-	}
-
-	/* The ring math needs a usable power of two. */
-	if (lemtoh32(&llq.efl_max_depth) < ENA_NDESCS_MIN)
+	/*
+	 * Pick 128-byte entries whenever the device offers them, and fall
+	 * back to wide 256-byte entries only when it does not.  128-byte
+	 * entries inline a standard L2/L3/L4 header and are the size this
+	 * driver has been exercised with end to end.  The device may
+	 * recommend wide entries (Linux enables Large LLQ on this
+	 * generation) for the larger inline header they carry; following
+	 * that recommendation is a later step once the wide path is
+	 * validated, not a correctness requirement - the device also lists
+	 * 128-byte entries as supported and accepts a SET asking for them.
+	 */
+	if (ISSET(lemtoh16(&llq.efl_entry_size_supported),
+	    ENA_LLQ_ENTRY_128)) {
+		esize = ENA_LLQ_ENTRY_MIN;
+		esize_bit = ENA_LLQ_ENTRY_128;
+	} else if (ISSET(lemtoh16(&llq.efl_entry_size_supported),
+	    ENA_LLQ_ENTRY_256)) {
+		esize = ENA_LLQ_ENTRY_MAX;
+		esize_bit = ENA_LLQ_ENTRY_256;
+	} else
 		return;
 
-	htolem16(&llq.efl_hdr_enabled, ENA_LLQ_HDR_INLINE);
-	htolem16(&llq.efl_entry_size_enabled, ENA_LLQ_ENTRY_128);
-	htolem16(&llq.efl_descs_before_hdr_enabled,
-	    ENA_LLQ_TWO_DESCS_BEFORE_HDR);
-	htolem16(&llq.efl_stride_enabled, ENA_LLQ_STRIDE_MULTIPLE);
-	htolem16(&llq.efl_accel_flags, ENA_LLQ_ACCEL_DISABLE_META_CACHING |
-	    ENA_LLQ_ACCEL_LIMIT_TX_BURST);
-	htolem16(&llq.efl_accel_burst, 0);
+	/*
+	 * Wide entries have their own depth cap; halving the normal
+	 * one is the documented fallback when the device names none.
+	 */
+	if (esize == ENA_LLQ_ENTRY_MAX) {
+		depth = lemtoh16(&llq.efl_max_wide_depth);
+		if (depth == 0)
+			depth = lemtoh32(&llq.efl_max_depth) / 2;
+	} else
+		depth = lemtoh32(&llq.efl_max_depth);
 
-	if (ena_aq_set_feature(sc, ENA_FEAT_LLQ, 0, &llq, sizeof(llq)) != 0)
+	/* The ring math needs a usable power of two. */
+	if (depth < ENA_NDESCS_MIN)
+		return;
+
+	/*
+	 * DISABLE_META_CACHING is the one accel mode we must honor: the
+	 * device keeps no meta descriptor across packets, so each packet
+	 * carries its own or the device transmits every frame against a
+	 * stale meta and drops it before the wire.  LIMIT_TX_BURST is left
+	 * off deliberately - enabling it puts the device into a burst read
+	 * mode where a single pushed entry makes it walk on through the
+	 * ring, so the burst budget stays disabled and doorbells are free.
+	 */
+	accel = lemtoh16(&llq.efl_accel_flags);
+	meta = ISSET(accel, ENA_LLQ_ACCEL_DISABLE_META_CACHING) ? 1 : 0;
+
+	/*
+	 * The SET carries only the driver's choices, everything else zero:
+	 * the GET buffer with its supported bitmaps and device facts is not
+	 * echoed back.
+	 */
+	memset(&set, 0, sizeof(set));
+	htolem16(&set.efl_hdr_enabled, ENA_LLQ_HDR_INLINE);
+	htolem16(&set.efl_entry_size_enabled, esize_bit);
+	htolem16(&set.efl_descs_before_hdr_enabled,
+	    ENA_LLQ_TWO_DESCS_BEFORE_HDR);
+	htolem16(&set.efl_stride_enabled, ENA_LLQ_STRIDE_MULTIPLE);
+	htolem16(&set.efl_accel_flags, ENA_LLQ_ACCEL_DISABLE_META_CACHING);
+
+	if (ena_aq_set_feature(sc, ENA_FEAT_LLQ, 1, &set, sizeof(set)) != 0)
 		return;
 
 	/* The caller folds this entry cap into the TX ring depth. */
-	sc->sc_llq_max_depth = lemtoh32(&llq.efl_max_depth);
+	sc->sc_llq_max_depth = depth;
+	sc->sc_llq_entry_size = esize;
 	sc->sc_llq_meta = meta;
-	sc->sc_llq_burst = burst;
+	sc->sc_llq_burst = 0;
+	/* Zero from the device means "no hint"; the entry is the cap. */
+	if (sc->sc_tx_max_hdr == 0 ||
+	    sc->sc_tx_max_hdr > esize - ENA_LLQ_HDR_OFF)
+		sc->sc_tx_max_hdr = esize - ENA_LLQ_HDR_OFF;
 	sc->sc_llq_on = 1;
 }
 
 /*
  * Fill and hand over the host info page.  The page must outlive the
  * command: firmware keeps reading it, so it is freed only on detach.
- * There is no OpenBSD OS type; FreeBSD is the closest relative that
- * firmware has been comfortable with for years.
+ * The identity is the minimal one proven on this fleet: Linux 2.0.0
+ * with nothing else filled in.
  */
 static void
-ena_hostinfo_init(struct ena_softc *sc, struct pci_attach_args *pa)
+ena_hostinfo_init(struct ena_softc *sc)
 {
 	struct ena_host_info *hi;
-	int bus, dev, fn;
 
 	if (ena_dmamem_alloc(sc, &sc->sc_hostinfo, PAGE_SIZE,
 	    PAGE_SIZE) != 0)
 		return;
 
 	hi = ENA_DMA_KVA(&sc->sc_hostinfo);
-	htolem32(&hi->ehi_os_type, ENA_HOST_OS_FREEBSD);
-	snprintf(hi->ehi_os_dist_str, sizeof(hi->ehi_os_dist_str),
-	    "OpenBSD %s", osrelease);
-	snprintf(hi->ehi_kernel_ver_str, sizeof(hi->ehi_kernel_ver_str),
-	    "%s", osversion);
+	htolem32(&hi->ehi_os_type, ENA_HOST_OS_LINUX);
 	htolem32(&hi->ehi_driver_version, ENA_DRIVER_VERSION);
 	htolem16(&hi->ehi_spec_version, ENA_HOST_SPEC_VERSION);
-	pci_decompose_tag(pa->pa_pc, pa->pa_tag, &bus, &dev, &fn);
-	htolem16(&hi->ehi_bdf, (bus << 8) | (dev << 3) | fn);
 	htolem16(&hi->ehi_num_cpus, ncpus);
 
 	ENA_DMA_SYNC(sc, &sc->sc_hostinfo, BUS_DMASYNC_PREWRITE);
@@ -1415,13 +1541,17 @@ ena_aenq_alloc(struct ena_softc *sc)
 	return (0);
 }
 
-/* Register the ring and negotiate groups; re-run after device reset. */
-static int
-ena_aenq_hwinit(struct ena_softc *sc)
+/*
+ * Register the AENQ ring: seed the host consumer state, hand the ring
+ * base and caps to the device.  Called from ena_admin_init(): the device
+ * brings its AENQ subsystem up during the admin queue handshake, and a
+ * ring registered after that handshake is only half-adopted - the later
+ * head doorbell write trips DEV_STS FATAL_ERROR, after which the device
+ * silently drops CREATE_CQ commands.
+ */
+static void
+ena_aenq_register(struct ena_softc *sc)
 {
-	struct ena_feat_aenq aenq;
-	uint32_t groups;
-
 	sc->sc_aenq_head = ENA_AENQ_NUM;
 	sc->sc_aenq_phase = 1;
 
@@ -1432,21 +1562,32 @@ ena_aenq_hwinit(struct ena_softc *sc)
 	ena_wr_base(sc, ENA_AENQ_BASE_LO, ENA_DMA_DVA(&sc->sc_aenq_ring));
 	ena_wr(sc, ENA_AENQ_CAPS,
 	    ENA_RING_CAPS(ENA_AENQ_NUM, sizeof(struct ena_aenq_desc)));
+}
+
+/*
+ * Subscribe to the event groups the driver handles.  A failure fails
+ * the whole device init, so the ring registration is not unwound here.
+ */
+static int
+ena_aenq_negotiate(struct ena_softc *sc)
+{
+	struct ena_feat_aenq aenq, set;
+	uint32_t groups;
 
 	/* Enable what we handle and the device can deliver, no more. */
 	if (ena_aq_get_feature(sc, ENA_FEAT_AENQ_CONFIG, 0,
 	    &aenq, sizeof(aenq)) != 0)
-		goto fail;
+		return (EIO);
 	groups = lemtoh32(&aenq.efa_supported_groups) & ENA_AENQ_GROUPS_MVP;
-	htolem32(&aenq.efa_enabled_groups, groups);
+
+	/* A clean SET, not the echoed GET buffer; see ena_llq_negotiate(). */
+	memset(&set, 0, sizeof(set));
+	htolem32(&set.efa_enabled_groups, groups);
 	if (ena_aq_set_feature(sc, ENA_FEAT_AENQ_CONFIG, 0,
-	    &aenq, sizeof(aenq)) != 0)
-		goto fail;
+	    &set, sizeof(set)) != 0)
+		return (EIO);
 
 	return (0);
-fail:
-	ena_wr(sc, ENA_AENQ_CAPS, 0);
-	return (EIO);
 }
 
 static void
@@ -1522,12 +1663,6 @@ ena_aenq_task(void *xsc)
 			break;
 		case ENA_AENQ_GROUP_KEEP_ALIVE:
 			sc->sc_keepalive_ts = getuptime();
-			sc->sc_rx_drops = (uint64_t)lemtoh32(
-			    &d->ead_u.eadu_keepalive.eak_rx_drops_hi) << 32 |
-			    lemtoh32(&d->ead_u.eadu_keepalive.eak_rx_drops_lo);
-			sc->sc_tx_drops = (uint64_t)lemtoh32(
-			    &d->ead_u.eadu_keepalive.eak_tx_drops_hi) << 32 |
-			    lemtoh32(&d->ead_u.eadu_keepalive.eak_tx_drops_lo);
 			break;
 		case ENA_AENQ_GROUP_FATAL_ERROR:
 			printf("%s: fatal device error, syndrome %u\n",
@@ -1608,11 +1743,14 @@ ena_rxr_alloc(struct ena_softc *sc)
 
 	rxr->rxr_slots = mallocarray(rxr->rxr_ndescs, sizeof(*slot),
 	    M_DEVBUF, M_WAITOK | M_ZERO);
+	rxr->rxr_ids = mallocarray(rxr->rxr_ndescs, sizeof(*rxr->rxr_ids),
+	    M_DEVBUF, M_WAITOK);
 
 	for (i = 0; i < rxr->rxr_ndescs; i++) {
+		rxr->rxr_ids[i] = i;
 		slot = &rxr->rxr_slots[i];
-		if (bus_dmamap_create(sc->sc_dmat, sc->sc_rx_buf_len +
-		    ETHER_ALIGN, 1, sc->sc_rx_buf_len + ETHER_ALIGN, 0,
+		if (bus_dmamap_create(sc->sc_dmat, sc->sc_rx_buf_len, 1,
+		    sc->sc_rx_buf_len, 0,
 		    BUS_DMA_WAITOK | BUS_DMA_64BIT, &slot->ers_map) != 0)
 			goto free_maps;
 	}
@@ -1622,6 +1760,8 @@ ena_rxr_alloc(struct ena_softc *sc)
 free_maps:
 	while (i-- > 0)
 		bus_dmamap_destroy(sc->sc_dmat, rxr->rxr_slots[i].ers_map);
+	free(rxr->rxr_ids, M_DEVBUF,
+	    rxr->rxr_ndescs * sizeof(*rxr->rxr_ids));
 	free(rxr->rxr_slots, M_DEVBUF,
 	    rxr->rxr_ndescs * sizeof(*slot));
 	ena_dmamem_free(sc, &rxr->rxr_cq_ring);
@@ -1655,6 +1795,8 @@ ena_rxr_free(struct ena_softc *sc, struct ena_rxr *rxr)
 
 	m_freem(rxr->rxr_m_head);
 
+	free(rxr->rxr_ids, M_DEVBUF,
+	    rxr->rxr_ndescs * sizeof(*rxr->rxr_ids));
 	free(rxr->rxr_slots, M_DEVBUF,
 	    rxr->rxr_ndescs * sizeof(*slot));
 	ena_dmamem_free(sc, &rxr->rxr_cq_ring);
@@ -1675,7 +1817,38 @@ ena_rxr_init(struct ena_softc *sc, struct ena_rxr *rxr)
 	rxr->rxr_m_head = NULL;
 	rxr->rxr_m_tail = &rxr->rxr_m_head;
 	rxr->rxr_m_len = 0;
-	if_rxr_init(&rxr->rxr_acct, 2, rxr->rxr_ndescs - 1);
+	/*
+	 * Pin the RX ring full and disable if_rxr's adaptive scaling by
+	 * equating the low- and high-water marks: the current watermark is
+	 * then nailed at a full ring (ndescs - 1), and neither the per-tick
+	 * grow (if_rxr_adjust_cwm) nor the livelock shrink (if_rxr_livelocked)
+	 * can move it.
+	 *
+	 * This is a correctness requirement of the device, not tuning.  On
+	 * Nitro v4+/v5 (sixth-generation) hardware the RX engine fetches SQ
+	 * descriptors lazily and silently drops every inbound frame it has
+	 * no armed buffer for, returning neither a completion nor an
+	 * interrupt.  The drop rate scales directly with how empty the ring
+	 * is kept, and with only a couple of buffers posted the device
+	 * delivers nothing at all.  Because a starved ring yields no
+	 * completions, the adaptive path (which grows only as completions
+	 * arrive) can never climb back out, so the ring has to be handed its
+	 * full complement up front and held there.  Every other ENA driver
+	 * (Linux, FreeBSD, illumos, DPDK, iPXE) does the same and none uses
+	 * an adaptive RX fill.  Amazon confirms the silent, unreported drops
+	 * on this generation:
+	 *   https://github.com/amzn/amzn-drivers/issues/235
+	 * FreeBSD carries an empty-ring recovery watchdog for the same
+	 * reason (review D12856):
+	 *   https://reviews.freebsd.org/D12856
+	 *
+	 * The one-slot gap (ndescs - 1, never ndescs) is mandatory as well:
+	 * besides the usual producer/consumer full-versus-empty gap, this
+	 * device faults - sets the fatal-error bit and wedges - if the SQ
+	 * doorbell ever reaches head + ring depth.  See illumos 14845:
+	 *   https://www.illumos.org/issues/14845
+	 */
+	if_rxr_init(&rxr->rxr_acct, rxr->rxr_ndescs - 1, rxr->rxr_ndescs - 1);
 
 	ENA_DMA_SYNC(sc, &rxr->rxr_cq_ring, BUS_DMASYNC_PREREAD);
 
@@ -1717,7 +1890,7 @@ ena_rxfill(struct ena_rxr *rxr)
 	struct ena_rx_slot *slot;
 	struct mbuf *m;
 	u_int slots, filled = 0, mask = rxr->rxr_ndescs - 1;
-	uint16_t prod;
+	uint16_t prod, req_id;
 	uint8_t phase;
 
 	mtx_enter(&rxr->rxr_mtx);
@@ -1732,13 +1905,20 @@ ena_rxfill(struct ena_rxr *rxr)
 	phase = rxr->rxr_sq_phase;
 
 	while (slots > 0) {
-		slot = &rxr->rxr_slots[prod & mask];
+		req_id = rxr->rxr_ids[prod & mask];
+		slot = &rxr->rxr_slots[req_id];
 		KASSERT(slot->ers_m == NULL);
 
-		m = MCLGETL(NULL, M_DONTWAIT, sc->sc_rx_buf_len + ETHER_ALIGN);
+		/*
+		 * Hand the buffer over at its natural alignment, without
+		 * the traditional ETHER_ALIGN shift: ENA takes no buffer
+		 * offset, and its sanctioned way to align the payload is
+		 * the device-applied RX_OFFSET feature, which ena_rxeof()
+		 * already honors.
+		 */
+		m = MCLGETL(NULL, M_DONTWAIT, sc->sc_rx_buf_len);
 		if (m == NULL)
 			break;
-		m->m_data += ETHER_ALIGN;
 		m->m_len = m->m_pkthdr.len = sc->sc_rx_buf_len;
 
 		if (bus_dmamap_load_mbuf(sc->sc_dmat, slot->ers_map, m,
@@ -1752,7 +1932,7 @@ ena_rxfill(struct ena_rxr *rxr)
 
 		rxd = &ring[prod & mask];
 		htolem16(&rxd->erd_length, slot->ers_map->dm_segs[0].ds_len);
-		htolem16(&rxd->erd_req_id, prod & mask);
+		htolem16(&rxd->erd_req_id, req_id);
 		htolem32(&rxd->erd_addr_lo, slot->ers_map->dm_segs[0].ds_addr);
 		htolem16(&rxd->erd_addr_hi,
 		    ena_addr_hi(slot->ers_map->dm_segs[0].ds_addr));
@@ -1864,6 +2044,9 @@ ena_rxeof(struct ena_rxr *rxr)
 			rxr->rxr_m_tail = &rxr->rxr_m_head;
 			rxr->rxr_m_len = 0;
 		}
+
+		/* The id returns to the free ring for a future refill. */
+		rxr->rxr_ids[rxr->rxr_cons & mask] = req_id;
 
 		rxr->rxr_cons++;
 		if ((rxr->rxr_cons & mask) == 0)
@@ -2065,7 +2248,7 @@ ena_tx_submit_host(struct ena_txr *txr, struct ena_tx_slot *slot)
 		len_ctrl = map->dm_segs[i].ds_len & ENA_TXD_LEN_MASK;
 		if (txr->txr_sq_phase)
 			len_ctrl |= ENA_TXD_PHASE;
-		meta_ctrl = ENA_TXD_DF | ENA_TXD_L4_CSUM_PARTIAL;
+		meta_ctrl = 0;
 
 		if (i == 0) {
 			len_ctrl |= ENA_TXD_FIRST | ENA_TXD_COMP_REQ;
@@ -2090,25 +2273,27 @@ ena_tx_submit_host(struct ena_txr *txr, struct ena_tx_slot *slot)
 }
 
 /*
- * LLQ submission.  The whole packet becomes one or more 128-byte
- * entries composed in a stack buffer and then copied into the device
- * window with 64-bit stores.  The first entry holds the (mandatory
- * with meta caching disabled) meta descriptor, the first data
- * descriptor and up to 96 pushed header bytes; if more descriptors
- * are needed they continue in follow-up entries, eight per entry.
- * Write-combining is safe here because the device reads entries only
- * after the doorbell; an entry must never be touched again once its
- * successor exists (see docs/research/ena-llq.md).
+ * LLQ submission.  The whole packet becomes one or more entries of
+ * the negotiated size, composed in a stack buffer and then copied
+ * into the device window with 64-bit stores.  The first entry holds
+ * the (mandatory with meta caching disabled) meta descriptor, the
+ * first data descriptor and the pushed header bytes filling the rest
+ * of the entry; if more descriptors are needed they continue in
+ * follow-up entries, entry_size / 16 per entry.  Write-combining is
+ * safe here because the device reads entries only after the doorbell;
+ * an entry must never be touched again once its successor exists
+ * (see docs/research/ena-llq.md).
  */
 
 static void
 ena_llq_flush(struct ena_txr *txr, uint64_t *entry)
 {
+	struct ena_softc *sc = txr->txr_sc;
 	volatile uint64_t *dst = (volatile uint64_t *)(txr->txr_llq_win +
-	    (txr->txr_prod & (txr->txr_ndescs - 1)) * ENA_LLQ_ENTRY_SIZE);
+	    (txr->txr_prod & (txr->txr_ndescs - 1)) * sc->sc_llq_entry_size);
 	unsigned int i;
 
-	for (i = 0; i < ENA_LLQ_ENTRY_SIZE / 8; i++)
+	for (i = 0; i < sc->sc_llq_entry_size / 8; i++)
 		dst[i] = entry[i];
 
 	txr->txr_prod++;
@@ -2120,8 +2305,10 @@ static unsigned int
 ena_tx_submit_llq(struct ena_txr *txr, struct ena_tx_slot *slot)
 {
 	struct ena_softc *sc = txr->txr_sc;
-	uint64_t entry[ENA_LLQ_ENTRY_SIZE / 8];
+	uint64_t entry[ENA_LLQ_ENTRY_MAX / 8];
 	struct ena_tx_desc *descs = (struct ena_tx_desc *)entry;
+	unsigned int descs_entry = sc->sc_llq_entry_size /
+	    sizeof(struct ena_tx_desc);
 	struct ena_tx_desc *txd;
 	bus_dmamap_t map = slot->ets_map;
 	struct mbuf *m = slot->ets_m;
@@ -2144,7 +2331,7 @@ ena_tx_submit_llq(struct ena_txr *txr, struct ena_tx_slot *slot)
 		need = 1;
 		if (ndescs > ENA_LLQ_DESCS_BEFORE_HDR) {
 			need += howmany(ndescs - ENA_LLQ_DESCS_BEFORE_HDR,
-			    ENA_LLQ_DESCS_PER_ENTRY);
+			    descs_entry);
 		}
 		if (txr->txr_burst_left < need)
 			ena_tx_kick(txr);
@@ -2191,7 +2378,7 @@ ena_tx_submit_llq(struct ena_txr *txr, struct ena_tx_slot *slot)
 		len_ctrl |= ENA_TXD_FIRST;
 	if (txr->txr_sq_phase)
 		len_ctrl |= ENA_TXD_PHASE;
-	meta_ctrl = ENA_TXD_DF | ENA_TXD_L4_CSUM_PARTIAL;
+	meta_ctrl = 0;
 	ena_tx_req_id(&len_ctrl, &meta_ctrl, req_id);
 	hi_hdr = (push << ENA_TXD_HDR_LEN_SHIFT) |
 	    (ena_addr_hi(addr) & ENA_TXD_ADDR_HI_MASK);
@@ -2210,16 +2397,15 @@ ena_tx_submit_llq(struct ena_txr *txr, struct ena_tx_slot *slot)
 			units++;
 			memset(entry, 0, sizeof(entry));
 			di = 0;
-			cap = ENA_LLQ_DESCS_PER_ENTRY;
+			cap = descs_entry;
 		}
 		txd = &descs[di++];
 
 		len_ctrl = seglen & ENA_TXD_LEN_MASK;
 		if (txr->txr_sq_phase)
 			len_ctrl |= ENA_TXD_PHASE;
+		/* The entry is pre-zeroed; only non-zero fields are set. */
 		htolem32(&txd->etd_len_ctrl, len_ctrl);
-		htolem32(&txd->etd_meta_ctrl,
-		    ENA_TXD_DF | ENA_TXD_L4_CSUM_PARTIAL);
 		htolem32(&txd->etd_addr_lo, addr);
 		htolem32(&txd->etd_addr_hi_hdr,
 		    ena_addr_hi(addr) & ENA_TXD_ADDR_HI_MASK);

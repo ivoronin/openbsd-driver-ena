@@ -74,6 +74,9 @@
 #define  ENA_DEV_STS_RESET_IN_PROGRESS	(1U << 3)
 #define  ENA_DEV_STS_FATAL_ERROR	(1U << 5)
 
+/* Response region for readless register reads, HI = LO + 4. */
+#define ENA_MMIO_RESP_LO		0x60
+
 /*
  * Reset reasons, written into ENA_DEV_CTL on device reset.  The device
  * reports them out-of-band (CloudWatch), so honest codes help debugging.
@@ -113,7 +116,6 @@ struct ena_mem_addr {
 #define ENA_AQ_OP_DESTROY_CQ		4
 #define ENA_AQ_OP_GET_FEATURE		8
 #define ENA_AQ_OP_SET_FEATURE		9
-#define ENA_AQ_OP_GET_STATS		11
 
 /* Command ids sit in bits 11:0 both in commands and completions. */
 #define ENA_AQ_CMD_ID_MASK		0x0fff
@@ -346,6 +348,7 @@ struct ena_feat_aenq {
 
 #define ENA_LLQ_HDR_INLINE		0x1
 #define ENA_LLQ_ENTRY_128		0x1
+#define ENA_LLQ_ENTRY_256		0x4
 #define ENA_LLQ_TWO_DESCS_BEFORE_HDR	0x2
 #define ENA_LLQ_STRIDE_MULTIPLE		0x2
 
@@ -515,9 +518,10 @@ struct ena_rx_cdesc {
  * host mode - the device parses headers itself; LLQ gives the field a
  * different meaning (number of pushed bytes).
  *
- * The l4_csum_partial bit tells the device the driver took care of the
- * L4 pseudo-header checksum; with checksum offload disabled it keeps
- * the device away from checksums entirely, so it is always set.
+ * With checksum offload disabled all checksum and DF control bits
+ * stay zero: ena-com sets them only for packets that carry an offload
+ * context, and the descriptors here mirror the reference byte for
+ * byte.
  */
 
 #define ENA_TXD_LEN_MASK		0xffff		/* etd_len_ctrl */
