@@ -16,6 +16,9 @@ layer and the FreeBSD ena(4) driver as read-only references.
 - The host-mode datapath.
 - The LLQ datapath, used by the newer Nitro generations (Graviton3
   and later).
+- Device statistics via kstat(4): per-ring and device-level software
+  counters, the device's own traffic and EC2 allowance counters read
+  over GET_STATS, and drop/overrun counts fed to `netstat -in`.
 
 ## What's planned
 
@@ -27,9 +30,8 @@ like this:
   MSI-X vector per queue pair), interrupt moderation, TSO.
 - Features: jumbo frames to MTU 9000, and honoring the device's
   recommended wide 256-byte LLQ entries (independent of jumbo).
-- Robustness: device statistics via kstat(4) - no device traffic or
-  drop counters are surfaced anywhere today - plus an RX empty-ring
-  recovery net beneath the pinned-full ring.
+- Robustness: an RX empty-ring recovery net beneath the pinned-full
+  ring.
 - Platforms: the OpenBSD 8.0 / -current port, including adding
   IFXF_MBUF_64BIT support.
 - Not planned: suspend/resume (instance hibernation) and ENI

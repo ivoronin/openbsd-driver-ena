@@ -49,6 +49,7 @@
 #include <sys/time.h>
 #include <sys/timeout.h>
 #include <sys/atomic.h>
+#include <sys/kstat.h>
 
 #include <machine/bus.h>
 #include <machine/intr.h>
@@ -89,6 +90,9 @@ CTASSERT(sizeof(struct ena_aq_create_cq_cmd) == 64);
 CTASSERT(sizeof(struct ena_aq_create_sq_cmd) == 64);
 CTASSERT(sizeof(struct ena_aq_destroy_cq_cmd) == 64);
 CTASSERT(sizeof(struct ena_aq_destroy_sq_cmd) == 64);
+CTASSERT(sizeof(struct ena_aq_get_stats_cmd) == 64);
+CTASSERT(sizeof(struct ena_basic_stats) == 56);
+CTASSERT(sizeof(struct ena_eni_stats) == 40);
 CTASSERT(sizeof(struct ena_rx_desc) == 16);
 CTASSERT(sizeof(struct ena_rx_cdesc) == 16);
 CTASSERT(sizeof(struct ena_tx_desc) == 16);
@@ -165,6 +169,101 @@ struct ena_rx_slot {
 };
 
 /*
+ * Software counters.  Each field has a single writer on the datapath
+ * (TX serialized by the ifq, the RX consumer only from the IO
+ * interrupt), so plain increments are safe; the kstat read snapshots
+ * them and a torn read costs at most one stale sample.  A kstat template
+ * binds each key to its field by offsetof (see ENA_KV), so field order
+ * and layout here are free - a template row only needs a field that
+ * exists, which the compiler checks.
+ */
+struct ena_txq_stats {
+	uint64_t		 packets;
+	uint64_t		 bytes;
+	uint64_t		 doorbells;
+	uint64_t		 dma_map_err;
+	uint64_t		 defrags;
+	uint64_t		 stalls;
+	uint64_t		 bad_reqid;
+	uint64_t		 desc_err;
+};
+
+struct ena_rxq_stats {
+	uint64_t		 packets;
+	uint64_t		 bytes;
+	uint64_t		 mbuf_alloc_err;
+	uint64_t		 dma_map_err;
+	uint64_t		 ring_empty;
+	uint64_t		 bad_reqid;
+	uint64_t		 desc_err;
+};
+
+/*
+ * Device-level driver counters, exported by the "device" kstat.  A field
+ * is mirrored in two more places: it needs a row in ena_kstat_device_tpl
+ * to be exported at all, and each reset_* field also has a row in
+ * ena_reset_reasons[] that bumps it by offset.  Adding a counter means
+ * touching all three (the compiler only catches a bad field name).
+ */
+struct ena_device_stats {
+	uint64_t		 resets;
+	uint64_t		 reset_keepalive;
+	uint64_t		 reset_admin_to;
+	uint64_t		 reset_miss_tx;
+	uint64_t		 reset_rx_reqid;
+	uint64_t		 reset_tx_reqid;
+	uint64_t		 reset_dev_err;
+	uint64_t		 reset_user;
+	uint64_t		 admin_cmds;
+	uint64_t		 admin_errors;
+	uint64_t		 admin_timeouts;
+	uint64_t		 aenq_link;
+	uint64_t		 aenq_keepalive;
+	uint64_t		 aenq_warning;
+	uint64_t		 aenq_notify;
+	uint64_t		 aenq_fatal;
+	uint64_t		 aenq_unknown;
+	uint64_t		 link_changes;
+};
+
+/*
+ * Decoded device counters from GET_STATS, refreshed on the stats task
+ * and read straight out by the basic/eni kstats (same offset-copy path
+ * as the software counters).  The device reports BASIC as lo/hi 32-bit
+ * halves and ENI as native little-endian; the task does that decode
+ * once so the kstat read stays a plain memory copy.
+ */
+struct ena_basic_cache {
+	uint64_t		 tx_bytes;
+	uint64_t		 tx_packets;
+	uint64_t		 rx_bytes;
+	uint64_t		 rx_packets;
+	uint64_t		 rx_drops;
+	uint64_t		 tx_drops;
+	uint64_t		 rx_overruns;
+};
+
+struct ena_eni_cache {
+	uint64_t		 bw_in_exceeded;
+	uint64_t		 bw_out_exceeded;
+	uint64_t		 pps_exceeded;
+	uint64_t		 conntrack_excd;
+	uint64_t		 linklocal_excd;
+};
+
+/*
+ * kstat key/value template: one COUNTER64 per entry.  Every kstat reads
+ * the same way - the value lives at `offset` into the struct the kstat
+ * points at, so one generic read copies them all and each key stays
+ * bound to its field (see ENA_KV).
+ */
+struct ena_kv_tpl {
+	const char		*name;
+	unsigned int		 unit;
+	size_t			 offset;
+};
+
+/*
  * RX ring pair: the SQ hands buffers to the device, the CQ describes
  * received packets.  req_ids are drawn from rxr_ids, a ring of free
  * ids: the device returns buffers in an order of its own choosing, so
@@ -195,6 +294,9 @@ struct ena_rxr {
 	struct mbuf		*rxr_m_head;
 	struct mbuf		**rxr_m_tail;
 	unsigned int		 rxr_m_len;
+
+	struct ena_rxq_stats	 rxr_st;
+	struct kstat		*rxr_kstat;
 };
 
 struct ena_tx_slot {
@@ -234,6 +336,9 @@ struct ena_txr {
 	/* watchdog state, touched only by the watchdog tick */
 	uint16_t		 txr_last_cq_cons;
 	unsigned int		 txr_stuck;
+
+	struct ena_txq_stats	 txr_st;
+	struct kstat		*txr_kstat;
 };
 
 struct ena_softc {
@@ -341,6 +446,37 @@ struct ena_softc {
 	int			 sc_llq_meta;	/* meta desc per packet */
 	unsigned int		 sc_llq_burst;	/* entries/doorbell, 0=inf */
 	uint32_t		 sc_llq_max_depth; /* TX entries in LLQ mode */
+
+	/*
+	 * Statistics.  The device-lifetime kstats and their read lock
+	 * live here; per-ring kstats hang off the rings.  sc_dev_st holds
+	 * the driver's own device-level counters; sc_basic/sc_eni cache the
+	 * device's own counters, refreshed by the stats task (systq, so it
+	 * never races the reset task) and copied out by the basic/eni
+	 * kstats.  Every kstat read is a plain offset copy.
+	 *
+	 * sc_kstat_lock serializes kstat reads against each other and against
+	 * kstat destroy; it does NOT cover the stats task, which writes
+	 * sc_basic/sc_eni lock-free.  So a read may see a half-updated cache -
+	 * a torn snapshot, harmless like the other counters here.
+	 */
+	struct rwlock		 sc_kstat_lock;
+	struct kstat		*sc_kstat_device;
+	struct kstat		*sc_kstat_basic;
+	struct kstat		*sc_kstat_eni;
+	struct task		 sc_stats_task;
+	struct ena_device_stats	 sc_dev_st;
+	struct ena_basic_cache	 sc_basic;
+	struct ena_eni_cache	 sc_eni;
+
+	/*
+	 * The stats task also feeds the device drop deltas into the ifnet
+	 * counters (netstat), using sc_basic as the baseline.  sc_stats_seen
+	 * gates the first sample (and every one after an up) so a fresh
+	 * baseline never turns the device's running total into one huge
+	 * delta.
+	 */
+	int			 sc_stats_seen;
 };
 #define DEVNAME(_sc)	((_sc)->sc_dev.dv_xname)
 
@@ -402,6 +538,8 @@ static int	ena_aq_get_feature(struct ena_softc *, uint8_t, uint8_t,
 		    void *, size_t);
 static int	ena_aq_set_feature(struct ena_softc *, uint8_t, uint8_t,
 		    const void *, size_t);
+static int	ena_aq_get_stats(struct ena_softc *, uint8_t, void *, size_t);
+static uint64_t	ena_stat64(const uint32_t *, const uint32_t *);
 
 static int	ena_get_device_attributes(struct ena_softc *, uint8_t *);
 static int	ena_get_queue_limits(struct ena_softc *);
@@ -433,7 +571,8 @@ static struct ena_txr *
 static void	ena_txr_free(struct ena_softc *, struct ena_txr *);
 static int	ena_txr_init(struct ena_softc *, struct ena_txr *);
 static void	ena_txr_deinit(struct ena_softc *, struct ena_txr *);
-static int	ena_load_mbuf(bus_dma_tag_t, bus_dmamap_t, struct mbuf *);
+static int	ena_load_mbuf(bus_dma_tag_t, bus_dmamap_t, struct mbuf *,
+		    int *);
 static unsigned int
 		ena_tx_submit_host(struct ena_txr *, struct ena_tx_slot *);
 static unsigned int
@@ -463,6 +602,15 @@ static void	ena_media_status(struct ifnet *, struct ifmediareq *);
 static void	ena_watchdog_tick(void *);
 static void	ena_reset_request(struct ena_softc *, int);
 static void	ena_reset_task(void *);
+
+static struct kstat *
+		ena_kstat_create(struct ena_softc *, const char *, unsigned int,
+		    const struct ena_kv_tpl *, unsigned int, void *);
+static void	ena_kstat_destroy(struct kstat **);
+static int	ena_kstat_kv_read(struct kstat *);
+static void	ena_stats_task(void *);
+static void	ena_kstat_attach(struct ena_softc *);
+static void	ena_kstat_detach(struct ena_softc *);
 
 static void	ena_set_mem_addr(struct ena_mem_addr *, bus_addr_t);
 
@@ -543,6 +691,7 @@ ena_attach(struct device *parent, struct device *self, void *aux)
 	sc->sc_dmat = pa->pa_dmat;
 
 	rw_init(&sc->sc_cfg_lock, "enacfg");
+	rw_init(&sc->sc_kstat_lock, "enakstat");
 	mtx_init(&sc->sc_link_mtx, IPL_NET);
 	/*
 	 * The ifnet default of LINK_STATE_UNKNOWN counts as up, so TX
@@ -550,9 +699,10 @@ ena_attach(struct device *parent, struct device *self, void *aux)
 	 * this cache only drives the media status display.
 	 */
 	sc->sc_link_state = LINK_STATE_DOWN;
-	/* Both tasks share systq, which serializes them cheaply. */
+	/* These tasks share systq, which serializes them cheaply. */
 	task_set(&sc->sc_aenq_task, ena_aenq_task, sc);
 	task_set(&sc->sc_reset_task, ena_reset_task, sc);
+	task_set(&sc->sc_stats_task, ena_stats_task, sc);
 	timeout_set(&sc->sc_watchdog_tmo, ena_watchdog_tick, sc);
 
 	memtype = pci_mapreg_type(pa->pa_pc, pa->pa_tag, ENA_PCI_BAR0);
@@ -676,6 +826,9 @@ ena_attach(struct device *parent, struct device *self, void *aux)
 	ether_ifattach(ifp);
 	sc->sc_attached = 1;
 
+	/* Device-lifetime statistics; per-ring kstats come up with the rings. */
+	ena_kstat_attach(sc);
+
 	/* From here on the device may raise events at us. */
 	ena_arm(sc);
 
@@ -730,8 +883,16 @@ ena_detach(struct device *self, int flags)
 	pci_intr_disestablish(sc->sc_pc, sc->sc_ih_admin);
 	task_del(systq, &sc->sc_aenq_task);
 	task_del(systq, &sc->sc_reset_task);
+	task_del(systq, &sc->sc_stats_task);
 	/* Wait out a task that was already running. */
 	taskq_barrier(systq);
+
+	/*
+	 * The stats task, the only stats path that issues admin commands,
+	 * is drained above; the kstats left here are pure offset copies of
+	 * softc memory, so their teardown order carries no admin hazard.
+	 */
+	ena_kstat_detach(sc);
 
 	ether_ifdetach(ifp);
 	if_detach(ifp);
@@ -972,6 +1133,8 @@ ena_aq_opcode_str(uint8_t opcode)
 		return ("GET_FEATURE");
 	case ENA_AQ_OP_SET_FEATURE:
 		return ("SET_FEATURE");
+	case ENA_AQ_OP_GET_STATS:
+		return ("GET_STATS");
 	default:
 		return ("unknown");
 	}
@@ -1002,7 +1165,8 @@ ena_aq_status_str(uint8_t status)
  * timeout means the device stopped talking to us; the queue is marked
  * dead and a device reset is requested from here.  Failures of any
  * kind are logged here, so callers only need the errno.
- * Callers are already serialized by attach/cfg paths; the mutex is
+ * Every caller runs at attach or under the cfg lock (the up/down/reset
+ * path and the stats task), so commands never overlap; the mutex is
  * belt and suspenders, not a hot lock.
  */
 static int
@@ -1023,6 +1187,7 @@ ena_aq_exec(struct ena_softc *sc, union ena_aq_cmd *cmd,
 		mtx_leave(&sc->sc_aq_mtx);
 		return (ENXIO);
 	}
+	sc->sc_dev_st.admin_cmds++;
 
 	cmdid = sc->sc_aq_prod & (ENA_AQ_NUM - 1);
 	slot = &aq[cmdid];
@@ -1048,6 +1213,7 @@ ena_aq_exec(struct ena_softc *sc, union ena_aq_cmd *cmd,
 
 		if (waited >= sc->sc_aq_timeout_us) {
 			sc->sc_aq_dead = 1;
+			sc->sc_dev_st.admin_timeouts++;
 			mtx_leave(&sc->sc_aq_mtx);
 			printf("%s: admin command %s timeout\n", DEVNAME(sc),
 			    ena_aq_opcode_str(cmd->aqc_desc.aqd_opcode));
@@ -1069,6 +1235,7 @@ ena_aq_exec(struct ena_softc *sc, union ena_aq_cmd *cmd,
 	if ((lemtoh16(&comp->acqd_command) & ENA_AQ_CMD_ID_MASK) !=
 	    cmdid) {
 		sc->sc_aq_dead = 1;
+		sc->sc_dev_st.admin_errors++;
 		mtx_leave(&sc->sc_aq_mtx);
 		printf("%s: admin completion out of order\n", DEVNAME(sc));
 		return (EIO);
@@ -1078,6 +1245,7 @@ ena_aq_exec(struct ena_softc *sc, union ena_aq_cmd *cmd,
 		*resp = *comp;
 	error = ena_aq_status_to_errno(comp->acqd_status);
 	if (error != 0) {
+		sc->sc_dev_st.admin_errors++;
 		/*
 		 * The one place every failed command of every current
 		 * and future caller reports itself; the callers only
@@ -1131,6 +1299,41 @@ ena_aq_set_feature(struct ena_softc *sc, uint8_t id, uint8_t version,
 	memcpy(cmd.aqc_feat.afc_data, buf, len);
 
 	return (ena_aq_exec(sc, &cmd, NULL));
+}
+
+/*
+ * Fetch device-side counters.  BASIC and ENI both come back inline in
+ * the completion, so this mirrors ena_aq_get_feature(): copy the right
+ * number of bytes out of acqd_data.  The caller decodes the payload.
+ */
+static int
+ena_aq_get_stats(struct ena_softc *sc, uint8_t type, void *buf, size_t len)
+{
+	union ena_aq_cmd cmd;
+	struct ena_acq_desc resp;
+	int error;
+
+	KASSERT(len <= sizeof(resp.acqd_data));
+
+	memset(&cmd, 0, sizeof(cmd));
+	cmd.aqc_get_stats.egs_opcode = ENA_AQ_OP_GET_STATS;
+	cmd.aqc_get_stats.egs_type = type;
+	cmd.aqc_get_stats.egs_scope = ENA_STATS_SCOPE_ETH;
+	htolem16(&cmd.aqc_get_stats.egs_device_id, ENA_STATS_DEVICE_MINE);
+
+	error = ena_aq_exec(sc, &cmd, &resp);
+	if (error != 0)
+		return (error);
+
+	memcpy(buf, resp.acqd_data, len);
+	return (0);
+}
+
+/* Reassemble a device counter from its little-endian 32-bit halves. */
+static uint64_t
+ena_stat64(const uint32_t *lo, const uint32_t *hi)
+{
+	return (((uint64_t)lemtoh32(hi) << 32) | lemtoh32(lo));
 }
 
 /*
@@ -1632,6 +1835,7 @@ ena_link_update(struct ena_softc *sc, int link)
 	if (ifp->if_link_state != link) {
 		ifp->if_link_state = link;
 		if_link_state_change(ifp);
+		sc->sc_dev_st.link_changes++;
 	}
 }
 
@@ -1656,6 +1860,7 @@ ena_aenq_task(void *xsc)
 		group = lemtoh16(&d->ead_group);
 		switch (group) {
 		case ENA_AENQ_GROUP_LINK_CHANGE:
+			sc->sc_dev_st.aenq_link++;
 			ena_link_update(sc,
 			    ISSET(lemtoh32(&d->ead_u.eadu_link.eal_flags),
 			    ENA_AENQ_LINK_UP) ?
@@ -1663,19 +1868,26 @@ ena_aenq_task(void *xsc)
 			break;
 		case ENA_AENQ_GROUP_KEEP_ALIVE:
 			sc->sc_keepalive_ts = getuptime();
+			sc->sc_dev_st.aenq_keepalive++;
 			break;
 		case ENA_AENQ_GROUP_FATAL_ERROR:
+			sc->sc_dev_st.aenq_fatal++;
 			printf("%s: fatal device error, syndrome %u\n",
 			    DEVNAME(sc), lemtoh16(&d->ead_syndrome));
 			ena_reset_request(sc, ENA_RESET_GENERIC);
 			break;
 		case ENA_AENQ_GROUP_WARNING:
 		case ENA_AENQ_GROUP_NOTIFICATION:
+			if (group == ENA_AENQ_GROUP_WARNING)
+				sc->sc_dev_st.aenq_warning++;
+			else
+				sc->sc_dev_st.aenq_notify++;
 			printf("%s: device event group %u syndrome %u\n",
 			    DEVNAME(sc), group, lemtoh16(&d->ead_syndrome));
 			break;
 		default:
 			/* Unknown events are ignored on purpose. */
+			sc->sc_dev_st.aenq_unknown++;
 			break;
 		}
 
@@ -1715,6 +1927,263 @@ ena_intr_queue(void *xsc)
 	}
 
 	return (1);
+}
+
+/*
+ * Statistics via kstat(4).
+ *
+ * Three device-lifetime kstats (created at attach) and two per-ring
+ * kstats (created with the rings, on up).  All are KSTAT_T_KV arrays
+ * of COUNTER64, and all read the same way: ena_kstat_kv_read() copies
+ * each value from its template offset into the struct the kstat points
+ * at.  The device's own counters (basic, eni) are refreshed into a
+ * cache by the stats task, so even those reads touch only memory.
+ */
+
+/* One counter: kstat key is the struct field name, value at its offset. */
+#define ENA_KV(_st, _field, _unit) \
+	{ #_field, _unit, offsetof(struct _st, _field) }
+
+/* One row per struct ena_device_stats field; reset_* also in ena_reset_reasons[]. */
+static const struct ena_kv_tpl ena_kstat_device_tpl[] = {
+	ENA_KV(ena_device_stats, resets,		KSTAT_KV_U_NONE),
+	ENA_KV(ena_device_stats, reset_keepalive,	KSTAT_KV_U_NONE),
+	ENA_KV(ena_device_stats, reset_admin_to,	KSTAT_KV_U_NONE),
+	ENA_KV(ena_device_stats, reset_miss_tx,		KSTAT_KV_U_NONE),
+	ENA_KV(ena_device_stats, reset_rx_reqid,	KSTAT_KV_U_NONE),
+	ENA_KV(ena_device_stats, reset_tx_reqid,	KSTAT_KV_U_NONE),
+	ENA_KV(ena_device_stats, reset_dev_err,		KSTAT_KV_U_NONE),
+	ENA_KV(ena_device_stats, reset_user,		KSTAT_KV_U_NONE),
+	ENA_KV(ena_device_stats, admin_cmds,		KSTAT_KV_U_NONE),
+	ENA_KV(ena_device_stats, admin_errors,		KSTAT_KV_U_NONE),
+	ENA_KV(ena_device_stats, admin_timeouts,	KSTAT_KV_U_NONE),
+	ENA_KV(ena_device_stats, aenq_link,		KSTAT_KV_U_NONE),
+	ENA_KV(ena_device_stats, aenq_keepalive,	KSTAT_KV_U_NONE),
+	ENA_KV(ena_device_stats, aenq_warning,		KSTAT_KV_U_NONE),
+	ENA_KV(ena_device_stats, aenq_notify,		KSTAT_KV_U_NONE),
+	ENA_KV(ena_device_stats, aenq_fatal,		KSTAT_KV_U_NONE),
+	ENA_KV(ena_device_stats, aenq_unknown,		KSTAT_KV_U_NONE),
+	ENA_KV(ena_device_stats, link_changes,		KSTAT_KV_U_NONE),
+};
+
+static const struct ena_kv_tpl ena_kstat_txq_tpl[] = {
+	ENA_KV(ena_txq_stats, packets,		KSTAT_KV_U_PACKETS),
+	ENA_KV(ena_txq_stats, bytes,		KSTAT_KV_U_BYTES),
+	ENA_KV(ena_txq_stats, doorbells,	KSTAT_KV_U_NONE),
+	ENA_KV(ena_txq_stats, dma_map_err,	KSTAT_KV_U_NONE),
+	ENA_KV(ena_txq_stats, defrags,		KSTAT_KV_U_NONE),
+	ENA_KV(ena_txq_stats, stalls,		KSTAT_KV_U_NONE),
+	ENA_KV(ena_txq_stats, bad_reqid,	KSTAT_KV_U_NONE),
+	ENA_KV(ena_txq_stats, desc_err,		KSTAT_KV_U_NONE),
+};
+
+static const struct ena_kv_tpl ena_kstat_rxq_tpl[] = {
+	ENA_KV(ena_rxq_stats, packets,		KSTAT_KV_U_PACKETS),
+	ENA_KV(ena_rxq_stats, bytes,		KSTAT_KV_U_BYTES),
+	ENA_KV(ena_rxq_stats, mbuf_alloc_err,	KSTAT_KV_U_NONE),
+	ENA_KV(ena_rxq_stats, dma_map_err,	KSTAT_KV_U_NONE),
+	ENA_KV(ena_rxq_stats, ring_empty,	KSTAT_KV_U_NONE),
+	ENA_KV(ena_rxq_stats, bad_reqid,	KSTAT_KV_U_NONE),
+	ENA_KV(ena_rxq_stats, desc_err,		KSTAT_KV_U_NONE),
+};
+
+static const struct ena_kv_tpl ena_kstat_basic_tpl[] = {
+	ENA_KV(ena_basic_cache, tx_bytes,	KSTAT_KV_U_BYTES),
+	ENA_KV(ena_basic_cache, tx_packets,	KSTAT_KV_U_PACKETS),
+	ENA_KV(ena_basic_cache, rx_bytes,	KSTAT_KV_U_BYTES),
+	ENA_KV(ena_basic_cache, rx_packets,	KSTAT_KV_U_PACKETS),
+	ENA_KV(ena_basic_cache, rx_drops,	KSTAT_KV_U_PACKETS),
+	ENA_KV(ena_basic_cache, tx_drops,	KSTAT_KV_U_PACKETS),
+	ENA_KV(ena_basic_cache, rx_overruns,	KSTAT_KV_U_PACKETS),
+};
+
+static const struct ena_kv_tpl ena_kstat_eni_tpl[] = {
+	ENA_KV(ena_eni_cache, bw_in_exceeded,	KSTAT_KV_U_PACKETS),
+	ENA_KV(ena_eni_cache, bw_out_exceeded,	KSTAT_KV_U_PACKETS),
+	ENA_KV(ena_eni_cache, pps_exceeded,	KSTAT_KV_U_PACKETS),
+	ENA_KV(ena_eni_cache, conntrack_excd,	KSTAT_KV_U_PACKETS),
+	ENA_KV(ena_eni_cache, linklocal_excd,	KSTAT_KV_U_PACKETS),
+};
+
+#undef ENA_KV
+
+static struct kstat *
+ena_kstat_create(struct ena_softc *sc, const char *name, unsigned int unit,
+    const struct ena_kv_tpl *tpl, unsigned int n, void *base)
+{
+	struct kstat *ks;
+	struct kstat_kv *kvs;
+	unsigned int i;
+
+	ks = kstat_create(DEVNAME(sc), 0, name, unit, KSTAT_T_KV, 0);
+	if (ks == NULL)
+		return (NULL);
+
+	kvs = mallocarray(n, sizeof(*kvs), M_DEVBUF, M_WAITOK | M_ZERO);
+	for (i = 0; i < n; i++)
+		kstat_kv_unit_init(&kvs[i], tpl[i].name,
+		    KSTAT_KV_T_COUNTER64, tpl[i].unit);
+
+	/* ks_softc is the stats-struct base ena_kstat_kv_read() offsets into. */
+	ks->ks_softc = base;
+	ks->ks_ptr = (void *)tpl;
+	ks->ks_data = kvs;
+	ks->ks_datalen = n * sizeof(*kvs);
+	ks->ks_read = ena_kstat_kv_read;
+	kstat_set_wlock(ks, &sc->sc_kstat_lock);
+	kstat_install(ks);
+
+	return (ks);
+}
+
+static void
+ena_kstat_destroy(struct kstat **ksp)
+{
+	struct kstat *ks = *ksp;
+	void *data;
+	size_t len;
+
+	if (ks == NULL)
+		return;
+
+	/*
+	 * kstat_destroy waits out any in-flight read (both take the
+	 * global kstat lock), so the kv buffer is unreferenced once it
+	 * returns.  Grab the pointers first: kstat_destroy frees ks.
+	 */
+	data = ks->ks_data;
+	len = ks->ks_datalen;
+	kstat_destroy(ks);
+	free(data, M_DEVBUF, len);
+	*ksp = NULL;
+}
+
+/*
+ * The one kstat read: every value is a uint64_t at its template offset
+ * into the struct ks_softc points at.  All five kstats share it - the
+ * device/txq/rxq software counters and the basic/eni caches alike.
+ */
+static int
+ena_kstat_kv_read(struct kstat *ks)
+{
+	const struct ena_kv_tpl *tpl = ks->ks_ptr;
+	struct kstat_kv *kvs = ks->ks_data;
+	const uint8_t *base = ks->ks_softc;
+	unsigned int i, n = ks->ks_datalen / sizeof(*kvs);
+
+	for (i = 0; i < n; i++)
+		kstat_kv_u64(&kvs[i]) =
+		    *(const uint64_t *)(base + tpl[i].offset);
+
+	nanouptime(&ks->ks_updated);
+	return (0);
+}
+
+/*
+ * Refresh the device's own counters into the caches the basic/eni
+ * kstats read, and feed the drop deltas into the ifnet counters that
+ * netstat -in shows.  Runs on systq (kicked once a second from the
+ * watchdog), so it is serialized against the reset task; it also takes
+ * the cfg lock so it serializes against an ioctl up/down exactly like
+ * every other admin caller, keeping the admin queue single-owner.
+ * sc_reset_pending bails early so a queued reset behind us on systq
+ * isn't delayed, and a failed GET_STATS just leaves the last cache in
+ * place.
+ */
+static void
+ena_stats_task(void *xsc)
+{
+	struct ena_softc *sc = xsc;
+	struct ifnet *ifp = &sc->sc_ac.ac_if;
+	struct ena_basic_stats bs;
+	struct ena_eni_stats es;
+
+	if (sc->sc_reset_pending)
+		return;
+
+	rw_enter_read(&sc->sc_cfg_lock);
+
+	if (ena_aq_get_stats(sc, ENA_STATS_TYPE_BASIC, &bs, sizeof(bs)) == 0) {
+		uint64_t rx_drops =
+		    ena_stat64(&bs.ebs_rx_drops_lo, &bs.ebs_rx_drops_hi);
+		uint64_t tx_drops =
+		    ena_stat64(&bs.ebs_tx_drops_lo, &bs.ebs_tx_drops_hi);
+		uint64_t rx_overruns =
+		    ena_stat64(&bs.ebs_rx_overruns_lo, &bs.ebs_rx_overruns_hi);
+
+		/*
+		 * Feed the delta since the last snapshot into netstat's
+		 * columns: rx drops are input queue drops, rx overruns (no
+		 * armed RX buffer) are input errors, tx drops are output
+		 * queue drops.  sc_stats_seen skips the first sample after
+		 * attach or an up, when sc_basic holds no real baseline yet
+		 * and a device reset may have zeroed the counters.
+		 */
+		if (sc->sc_stats_seen) {
+			if (rx_drops >= sc->sc_basic.rx_drops)
+				ifp->if_iqdrops += rx_drops - sc->sc_basic.rx_drops;
+			if (rx_overruns >= sc->sc_basic.rx_overruns)
+				ifp->if_ierrors +=
+				    rx_overruns - sc->sc_basic.rx_overruns;
+			if (tx_drops >= sc->sc_basic.tx_drops)
+				ifp->if_oqdrops += tx_drops - sc->sc_basic.tx_drops;
+		}
+
+		/*
+		 * Update the cache only after the delta feed above: sc_basic
+		 * is that feed's baseline, so these stores must not move ahead
+		 * of it or every delta silently reads zero.
+		 */
+		sc->sc_basic.tx_bytes =
+		    ena_stat64(&bs.ebs_tx_bytes_lo, &bs.ebs_tx_bytes_hi);
+		sc->sc_basic.tx_packets =
+		    ena_stat64(&bs.ebs_tx_pkts_lo, &bs.ebs_tx_pkts_hi);
+		sc->sc_basic.rx_bytes =
+		    ena_stat64(&bs.ebs_rx_bytes_lo, &bs.ebs_rx_bytes_hi);
+		sc->sc_basic.rx_packets =
+		    ena_stat64(&bs.ebs_rx_pkts_lo, &bs.ebs_rx_pkts_hi);
+		sc->sc_basic.rx_drops = rx_drops;
+		sc->sc_basic.tx_drops = tx_drops;
+		sc->sc_basic.rx_overruns = rx_overruns;
+		sc->sc_stats_seen = 1;
+	}
+
+	if (ISSET(sc->sc_capabilities, ENA_CAP_ENI_STATS) &&
+	    ena_aq_get_stats(sc, ENA_STATS_TYPE_ENI, &es, sizeof(es)) == 0) {
+		sc->sc_eni.bw_in_exceeded = lemtoh64(&es.ees_bw_in_exceeded);
+		sc->sc_eni.bw_out_exceeded = lemtoh64(&es.ees_bw_out_exceeded);
+		sc->sc_eni.pps_exceeded = lemtoh64(&es.ees_pps_exceeded);
+		sc->sc_eni.conntrack_excd = lemtoh64(&es.ees_conntrack_exceeded);
+		sc->sc_eni.linklocal_excd = lemtoh64(&es.ees_linklocal_exceeded);
+	}
+
+	rw_exit_read(&sc->sc_cfg_lock);
+}
+
+/*
+ * Device-lifetime kstats.  The eni kstat exists only when the device
+ * advertises ENI stats; on a device without that capability GET_STATS
+ * (ENI) would just fail, so there is no point in the kstat.
+ */
+static void
+ena_kstat_attach(struct ena_softc *sc)
+{
+	sc->sc_kstat_device = ena_kstat_create(sc, "device", 0,
+	    ena_kstat_device_tpl, nitems(ena_kstat_device_tpl), &sc->sc_dev_st);
+	sc->sc_kstat_basic = ena_kstat_create(sc, "basic", 0,
+	    ena_kstat_basic_tpl, nitems(ena_kstat_basic_tpl), &sc->sc_basic);
+	if (ISSET(sc->sc_capabilities, ENA_CAP_ENI_STATS)) {
+		sc->sc_kstat_eni = ena_kstat_create(sc, "eni", 0,
+		    ena_kstat_eni_tpl, nitems(ena_kstat_eni_tpl), &sc->sc_eni);
+	}
+}
+
+static void
+ena_kstat_detach(struct ena_softc *sc)
+{
+	ena_kstat_destroy(&sc->sc_kstat_device);
+	ena_kstat_destroy(&sc->sc_kstat_basic);
+	ena_kstat_destroy(&sc->sc_kstat_eni);
 }
 
 /*
@@ -1868,12 +2337,18 @@ ena_rxr_init(struct ena_softc *sc, struct ena_rxr *rxr)
 
 	ena_rxfill(rxr);
 
+	/* unit is the queue index; single RX ring today. */
+	rxr->rxr_kstat = ena_kstat_create(sc, "rxq", 0, ena_kstat_rxq_tpl,
+	    nitems(ena_kstat_rxq_tpl), &rxr->rxr_st);
+
 	return (0);
 }
 
 static void
 ena_rxr_deinit(struct ena_softc *sc, struct ena_rxr *rxr)
 {
+	ena_kstat_destroy(&rxr->rxr_kstat);
+
 	/* If the admin queue died these fail quietly; reset cleans up. */
 	ena_aq_destroy_sq(sc, rxr->rxr_sq_idx, ENA_SQ_DIR_RX);
 	ena_aq_destroy_cq(sc, rxr->rxr_cq_idx);
@@ -1917,12 +2392,15 @@ ena_rxfill(struct ena_rxr *rxr)
 		 * already honors.
 		 */
 		m = MCLGETL(NULL, M_DONTWAIT, sc->sc_rx_buf_len);
-		if (m == NULL)
+		if (m == NULL) {
+			rxr->rxr_st.mbuf_alloc_err++;
 			break;
+		}
 		m->m_len = m->m_pkthdr.len = sc->sc_rx_buf_len;
 
 		if (bus_dmamap_load_mbuf(sc->sc_dmat, slot->ers_map, m,
 		    BUS_DMA_NOWAIT) != 0) {
+			rxr->rxr_st.dma_map_err++;
 			m_freem(m);
 			break;
 		}
@@ -1956,8 +2434,10 @@ ena_rxfill(struct ena_rxr *rxr)
 	}
 
 	/* Out of clusters entirely: retry from the refill timeout. */
-	if (if_rxr_inuse(&rxr->rxr_acct) == 0)
+	if (if_rxr_inuse(&rxr->rxr_acct) == 0) {
+		rxr->rxr_st.ring_empty++;
 		timeout_add(&rxr->rxr_refill, 1);
+	}
 
 	mtx_leave(&rxr->rxr_mtx);
 }
@@ -1997,6 +2477,7 @@ ena_rxeof(struct ena_rxr *rxr)
 
 		if (ISSET(sc->sc_capabilities, ENA_CAP_CDESC_MBZ) &&
 		    ISSET(status, ENA_RXC_MBZ7 | ENA_RXC_MBZ17)) {
+			rxr->rxr_st.desc_err++;
 			printf("%s: corrupted rx completion\n", DEVNAME(sc));
 			ena_reset_request(sc, ENA_RESET_GENERIC);
 			break;
@@ -2005,6 +2486,7 @@ ena_rxeof(struct ena_rxr *rxr)
 		req_id = lemtoh16(&rxc->erc_req_id);
 		if (req_id >= rxr->rxr_ndescs ||
 		    rxr->rxr_slots[req_id].ers_m == NULL) {
+			rxr->rxr_st.bad_reqid++;
 			printf("%s: invalid rx req_id %u\n", DEVNAME(sc),
 			    req_id);
 			ena_reset_request(sc, ENA_RESET_INV_RX_REQ_ID);
@@ -2013,6 +2495,7 @@ ena_rxeof(struct ena_rxr *rxr)
 
 		first = (rxr->rxr_m_head == NULL);
 		if (first != !!ISSET(status, ENA_RXC_FIRST)) {
+			rxr->rxr_st.desc_err++;
 			printf("%s: rx chain out of sync\n", DEVNAME(sc));
 			ena_reset_request(sc, ENA_RESET_GENERIC);
 			break;
@@ -2039,6 +2522,9 @@ ena_rxeof(struct ena_rxr *rxr)
 			m = rxr->rxr_m_head;
 			m->m_pkthdr.len = rxr->rxr_m_len;
 			ml_enqueue(&ml, m);
+
+			rxr->rxr_st.packets++;
+			rxr->rxr_st.bytes += rxr->rxr_m_len;
 
 			rxr->rxr_m_head = NULL;
 			rxr->rxr_m_tail = &rxr->rxr_m_head;
@@ -2186,12 +2672,18 @@ ena_txr_init(struct ena_softc *sc, struct ena_txr *txr)
 		return (error);
 	}
 
+	/* unit is the queue index; single TX ring today. */
+	txr->txr_kstat = ena_kstat_create(sc, "txq", 0, ena_kstat_txq_tpl,
+	    nitems(ena_kstat_txq_tpl), &txr->txr_st);
+
 	return (0);
 }
 
 static void
 ena_txr_deinit(struct ena_softc *sc, struct ena_txr *txr)
 {
+	ena_kstat_destroy(&txr->txr_kstat);
+
 	/* If the admin queue died these fail quietly; reset cleans up. */
 	ena_aq_destroy_sq(sc, txr->txr_sq_idx, ENA_SQ_DIR_TX);
 	ena_aq_destroy_cq(sc, txr->txr_cq_idx);
@@ -2200,13 +2692,18 @@ ena_txr_deinit(struct ena_softc *sc, struct ena_txr *txr)
 }
 
 static int
-ena_load_mbuf(bus_dma_tag_t dmat, bus_dmamap_t map, struct mbuf *m)
+ena_load_mbuf(bus_dma_tag_t dmat, bus_dmamap_t map, struct mbuf *m,
+    int *defragged)
 {
+	*defragged = 0;
+
 	switch (bus_dmamap_load_mbuf(dmat, map, m,
 	    BUS_DMA_STREAMING | BUS_DMA_NOWAIT)) {
 	case 0:
 		return (0);
 	case EFBIG:
+		/* Too many segments; collapse and retry once. */
+		*defragged = 1;
 		if (m_defrag(m, M_DONTWAIT) == 0 &&
 		    bus_dmamap_load_mbuf(dmat, map, m,
 		    BUS_DMA_STREAMING | BUS_DMA_NOWAIT) == 0)
@@ -2442,6 +2939,7 @@ ena_tx_kick(struct ena_txr *txr)
 		ENA_DMA_SYNC(sc, &txr->txr_sq_ring, BUS_DMASYNC_PREWRITE);
 
 	ena_wr(sc, txr->txr_db_off, txr->txr_prod);
+	txr->txr_st.doorbells++;
 }
 
 static void
@@ -2453,6 +2951,7 @@ ena_start(struct ifqueue *ifq)
 	struct ena_tx_slot *slot;
 	struct mbuf *m;
 	unsigned int free, post = 0;
+	int rv, defragged;
 
 	if (!LINK_STATE_IS_UP(ifp->if_link_state)) {
 		ifq_purge(ifq);
@@ -2468,6 +2967,7 @@ ena_start(struct ifqueue *ifq)
 		/* One spare slot distinguishes a full ring from empty. */
 		free = txr->txr_ndescs - 1 - txr->txr_used;
 		if (free < ENA_TX_NSEGS) {
+			txr->txr_st.stalls++;
 			ifq_set_oactive(ifq);
 			break;
 		}
@@ -2481,6 +2981,7 @@ ena_start(struct ifqueue *ifq)
 			 * a busy slot here means completions lag a
 			 * whole ring behind - back off.
 			 */
+			txr->txr_st.stalls++;
 			ifq_set_oactive(ifq);
 			break;
 		}
@@ -2489,7 +2990,11 @@ ena_start(struct ifqueue *ifq)
 		if (m == NULL)
 			break;
 
-		if (ena_load_mbuf(sc->sc_dmat, slot->ets_map, m) != 0) {
+		rv = ena_load_mbuf(sc->sc_dmat, slot->ets_map, m, &defragged);
+		if (defragged)
+			txr->txr_st.defrags++;
+		if (rv != 0) {
+			txr->txr_st.dma_map_err++;
 			ifq->ifq_errors++;
 			m_freem(m);
 			continue;
@@ -2506,6 +3011,8 @@ ena_start(struct ifqueue *ifq)
 		slot->ets_m = m;
 		slot->ets_ndescs = (*sc->sc_tx_submit)(txr, slot);
 		atomic_add_int(&txr->txr_used, slot->ets_ndescs);
+		txr->txr_st.packets++;
+		txr->txr_st.bytes += m->m_pkthdr.len;
 		post = 1;
 	}
 
@@ -2538,6 +3045,7 @@ ena_txeof(struct ena_txr *txr)
 
 		if (ISSET(sc->sc_capabilities, ENA_CAP_CDESC_MBZ) &&
 		    ISSET(txc->etc_flags, ENA_TXC_F_MBZ)) {
+			txr->txr_st.desc_err++;
 			printf("%s: corrupted tx completion\n", DEVNAME(sc));
 			ena_reset_request(sc, ENA_RESET_GENERIC);
 			break;
@@ -2546,6 +3054,7 @@ ena_txeof(struct ena_txr *txr)
 		req_id = lemtoh16(&txc->etc_req_id);
 		if (req_id >= txr->txr_ndescs ||
 		    txr->txr_slots[req_id].ets_m == NULL) {
+			txr->txr_st.bad_reqid++;
 			printf("%s: invalid tx req_id %u\n", DEVNAME(sc),
 			    req_id);
 			ena_reset_request(sc, ENA_RESET_INV_TX_REQ_ID);
@@ -2644,6 +3153,8 @@ ena_up(struct ena_softc *sc)
 	    ena_tx_submit_llq : ena_tx_submit_host;
 
 	sc->sc_keepalive_ts = getuptime();
+	/* Re-baseline the device drop delta; a reset zeroed the counters. */
+	sc->sc_stats_seen = 0;
 	SET(ifp->if_flags, IFF_RUNNING);
 	timeout_add_sec(&sc->sc_watchdog_tmo, 1);
 
@@ -2825,30 +3336,55 @@ ena_watchdog_tick(void *xsc)
 	if (txr != NULL && ena_txr_stalled(txr))
 		ena_reset_request(sc, ENA_RESET_MISS_TX_CMPL);
 
+	/*
+	 * Refresh the device counters for the basic/eni kstats.  The work
+	 * runs on systq so it can issue admin commands and stays serialized
+	 * with the reset task; skip queuing it while recovery is pending so
+	 * it never lands in the middle of one.
+	 */
+	if (!sc->sc_reset_pending)
+		task_add(systq, &sc->sc_stats_task);
+
 	timeout_add_sec(&sc->sc_watchdog_tmo, 1);
 }
+
+/*
+ * Everything the driver knows about a reset reason: its name and which
+ * per-reason counter it bumps.  Indexed by the ENA_RESET_* value (a
+ * sparse hardware enum, so gaps zero-init to {NULL, 0}).  stat_off is an
+ * offset into ena_device_stats (the same field ena_kstat_device_tpl
+ * exports); 0 means no dedicated counter, safe as a sentinel because the
+ * always-bumped `resets` sits at offset 0 and is never a reason's own
+ * counter.  Only reasons that reach ena_reset_request() need a row; the
+ * rest fall through to "unknown".
+ */
+static const struct {
+	const char	*name;
+	size_t		 stat_off;
+} ena_reset_reasons[] = {
+	[ENA_RESET_KEEP_ALIVE_TO] = { "keepalive timeout",
+	    offsetof(struct ena_device_stats, reset_keepalive) },
+	[ENA_RESET_ADMIN_TO]      = { "admin command timeout",
+	    offsetof(struct ena_device_stats, reset_admin_to) },
+	[ENA_RESET_MISS_TX_CMPL]  = { "tx completions missing",
+	    offsetof(struct ena_device_stats, reset_miss_tx) },
+	[ENA_RESET_INV_RX_REQ_ID] = { "invalid rx req_id",
+	    offsetof(struct ena_device_stats, reset_rx_reqid) },
+	[ENA_RESET_INV_TX_REQ_ID] = { "invalid tx req_id",
+	    offsetof(struct ena_device_stats, reset_tx_reqid) },
+	[ENA_RESET_USER_TRIGGER]  = { "user trigger",
+	    offsetof(struct ena_device_stats, reset_user) },
+	[ENA_RESET_GENERIC]       = { "device error",
+	    offsetof(struct ena_device_stats, reset_dev_err) },
+};
 
 static const char *
 ena_reset_reason_str(int reason)
 {
-	switch (reason) {
-	case ENA_RESET_KEEP_ALIVE_TO:
-		return ("keepalive timeout");
-	case ENA_RESET_ADMIN_TO:
-		return ("admin command timeout");
-	case ENA_RESET_MISS_TX_CMPL:
-		return ("tx completions missing");
-	case ENA_RESET_INV_RX_REQ_ID:
-		return ("invalid rx req_id");
-	case ENA_RESET_INV_TX_REQ_ID:
-		return ("invalid tx req_id");
-	case ENA_RESET_USER_TRIGGER:
-		return ("user trigger");
-	case ENA_RESET_GENERIC:
-		return ("device error");
-	default:
-		return ("unknown");
-	}
+	if (reason >= 0 && reason < (int)nitems(ena_reset_reasons) &&
+	    ena_reset_reasons[reason].name != NULL)
+		return (ena_reset_reasons[reason].name);
+	return ("unknown");
 }
 
 static void
@@ -2882,6 +3418,21 @@ ena_reset_task(void *xsc)
 	if (sc->sc_dead || !sc->sc_attached) {
 		NET_UNLOCK();
 		return;
+	}
+
+	/*
+	 * Count the reset here, not at the request site: this runs once
+	 * per reset actually performed and is serialized on systq, so the
+	 * counters stay single-writer and never double-count a reset that
+	 * several contexts requested at the same time.
+	 */
+	sc->sc_dev_st.resets++;
+	if (sc->sc_reset_reason >= 0 &&
+	    sc->sc_reset_reason < (int)nitems(ena_reset_reasons) &&
+	    ena_reset_reasons[sc->sc_reset_reason].stat_off != 0) {
+		uint64_t *ctr = (uint64_t *)((char *)&sc->sc_dev_st +
+		    ena_reset_reasons[sc->sc_reset_reason].stat_off);
+		(*ctr)++;
 	}
 
 	link_state = ifp->if_link_state;

@@ -116,6 +116,7 @@ struct ena_mem_addr {
 #define ENA_AQ_OP_DESTROY_CQ		4
 #define ENA_AQ_OP_GET_FEATURE		8
 #define ENA_AQ_OP_SET_FEATURE		9
+#define ENA_AQ_OP_GET_STATS		11
 
 /* Command ids sit in bits 11:0 both in commands and completions. */
 #define ENA_AQ_CMD_ID_MASK		0x0fff
@@ -210,6 +211,58 @@ struct ena_aq_destroy_cq_cmd {
 	uint8_t			 edcq_rsvd1[56];
 } __packed __aligned(8);
 
+/*
+ * GET_STATS: device-side counters.  BASIC (traffic and drops) is
+ * always available; ENI (traffic-shaping allowance counters) is gated
+ * on the ENI_STATS capability.  Both payloads fit inline in the
+ * 56-byte completion, so no control buffer is needed.  Scope ETH and
+ * device_id "mine" ask for this device's aggregate counters.
+ */
+#define ENA_STATS_TYPE_BASIC		0
+#define ENA_STATS_TYPE_ENI		2
+#define ENA_STATS_SCOPE_ETH		1
+#define ENA_STATS_DEVICE_MINE		0xffff	/* egs_device_id */
+
+struct ena_aq_get_stats_cmd {
+	uint16_t		 egs_command_id;
+	uint8_t			 egs_opcode;
+	uint8_t			 egs_flags;
+	uint32_t		 egs_ctrl[3];	/* control buffer, unused */
+	uint8_t			 egs_type;
+	uint8_t			 egs_scope;
+	uint16_t		 egs_rsvd0;
+	uint16_t		 egs_queue_idx;
+	uint16_t		 egs_device_id;
+	uint8_t			 egs_rsvd1[40];
+} __packed __aligned(8);
+
+/* GET_STATS(BASIC) payload, overlaid on acqd_data.  64-bit lo/hi pairs. */
+struct ena_basic_stats {
+	uint32_t		 ebs_tx_bytes_lo;
+	uint32_t		 ebs_tx_bytes_hi;
+	uint32_t		 ebs_tx_pkts_lo;
+	uint32_t		 ebs_tx_pkts_hi;
+	uint32_t		 ebs_rx_bytes_lo;
+	uint32_t		 ebs_rx_bytes_hi;
+	uint32_t		 ebs_rx_pkts_lo;
+	uint32_t		 ebs_rx_pkts_hi;
+	uint32_t		 ebs_rx_drops_lo;
+	uint32_t		 ebs_rx_drops_hi;
+	uint32_t		 ebs_tx_drops_lo;
+	uint32_t		 ebs_tx_drops_hi;
+	uint32_t		 ebs_rx_overruns_lo;
+	uint32_t		 ebs_rx_overruns_hi;
+} __packed;
+
+/* GET_STATS(ENI) payload, overlaid on acqd_data.  Native 64-bit. */
+struct ena_eni_stats {
+	uint64_t		 ees_bw_in_exceeded;
+	uint64_t		 ees_bw_out_exceeded;
+	uint64_t		 ees_pps_exceeded;
+	uint64_t		 ees_conntrack_exceeded;
+	uint64_t		 ees_linklocal_exceeded;
+} __packed;
+
 union ena_aq_cmd {
 	struct ena_aq_desc		 aqc_desc;
 	struct ena_aq_feat_cmd		 aqc_feat;
@@ -217,6 +270,7 @@ union ena_aq_cmd {
 	struct ena_aq_create_sq_cmd	 aqc_create_sq;
 	struct ena_aq_destroy_cq_cmd	 aqc_destroy_cq;
 	struct ena_aq_destroy_sq_cmd	 aqc_destroy_sq;
+	struct ena_aq_get_stats_cmd	 aqc_get_stats;
 };
 
 /*
@@ -293,6 +347,7 @@ struct ena_feat_device_attr {
 } __packed;
 
 /* eda_capabilities bits */
+#define ENA_CAP_ENI_STATS		(1U << 0)
 #define ENA_CAP_EXT_RESET_REASONS	(1U << 3)
 #define ENA_CAP_CDESC_MBZ		(1U << 4)
 
@@ -433,7 +488,12 @@ struct ena_aenq_link {
 #define ENA_AENQ_LINK_UP		(1U << 0)
 } __packed;
 
-/* Keepalive events carry device-side drop counters as 32-bit halves. */
+/*
+ * Keepalive events carry device-side drop counters as 32-bit halves.
+ * The driver does not read them (it takes the same counters from
+ * GET_STATS(BASIC) instead, on the stats task); this documents the
+ * event's wire layout for reference only.
+ */
 struct ena_aenq_keepalive {
 	uint32_t		 eak_rx_drops_lo;
 	uint32_t		 eak_rx_drops_hi;
