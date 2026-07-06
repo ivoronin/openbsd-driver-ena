@@ -341,6 +341,18 @@ struct ena_txr {
 	struct kstat		*txr_kstat;
 };
 
+/*
+ * The TX submission seam, chosen once at if_init: host mode writes
+ * descriptors into the SQ ring in RAM, LLQ pushes them into device memory.
+ * Both halves - the per-packet layout (submit) and the per-batch publish
+ * (kick) - live in one table so the pair can never be mismatched.  submit
+ * returns the SQ units (descriptors or entries) the packet consumed.
+ */
+struct ena_tx_ops {
+	unsigned int	(*txo_submit)(struct ena_txr *, struct ena_tx_slot *);
+	void		(*txo_kick)(struct ena_txr *);
+};
+
 struct ena_softc {
 	struct device		 sc_dev;
 	struct arpcom		 sc_ac;
@@ -430,21 +442,13 @@ struct ena_softc {
 	unsigned int		 sc_tx_ndescs;
 	unsigned int		 sc_rx_buf_len;	/* payload bytes per RX buffer */
 
-	/*
-	 * The seam between the TX submission modes: host mode writes
-	 * descriptors into the SQ ring in RAM, LLQ pushes them into
-	 * device memory.  Everything else in the TX path is shared.
-	 * Returns the number of SQ units (descriptors or entries) the
-	 * packet consumed.
-	 */
-	unsigned int		(*sc_tx_submit)(struct ena_txr *,
-				    struct ena_tx_slot *);
+	/* TX submission seam (host | LLQ), chosen at if_init; see ena_tx_ops. */
+	const struct ena_tx_ops	*sc_tx_ops;
 
 	/* LLQ negotiation results. */
 	int			 sc_llq_on;
 	unsigned int		 sc_llq_entry_size; /* 128 or wide 256 */
-	int			 sc_llq_meta;	/* meta desc per packet */
-	unsigned int		 sc_llq_burst;	/* entries/doorbell, 0=inf */
+	unsigned int		 sc_llq_burst;	/* entries per doorbell */
 	uint32_t		 sc_llq_max_depth; /* TX entries in LLQ mode */
 
 	/*
@@ -544,6 +548,7 @@ static uint64_t	ena_stat64(const uint32_t *, const uint32_t *);
 static int	ena_get_device_attributes(struct ena_softc *, uint8_t *);
 static int	ena_get_queue_limits(struct ena_softc *);
 static int	ena_dev_init(struct ena_softc *, int, uint8_t *);
+static void	ena_dev_fini(struct ena_softc *);
 static void	ena_hostinfo_init(struct ena_softc *);
 static void	ena_hostinfo_set(struct ena_softc *);
 
@@ -571,13 +576,14 @@ static struct ena_txr *
 static void	ena_txr_free(struct ena_softc *, struct ena_txr *);
 static int	ena_txr_init(struct ena_softc *, struct ena_txr *);
 static void	ena_txr_deinit(struct ena_softc *, struct ena_txr *);
-static int	ena_load_mbuf(bus_dma_tag_t, bus_dmamap_t, struct mbuf *,
-		    int *);
+static int	ena_load_mbuf(struct ena_txr *, bus_dmamap_t, struct mbuf *);
 static unsigned int
 		ena_tx_submit_host(struct ena_txr *, struct ena_tx_slot *);
 static unsigned int
 		ena_tx_submit_llq(struct ena_txr *, struct ena_tx_slot *);
-static void	ena_tx_kick(struct ena_txr *);
+static void	ena_tx_doorbell(struct ena_txr *);
+static void	ena_tx_kick_host(struct ena_txr *);
+static void	ena_tx_kick_llq(struct ena_txr *);
 static void	ena_txeof(struct ena_txr *);
 static int	ena_txr_stalled(struct ena_txr *);
 
@@ -837,11 +843,9 @@ ena_attach(struct device *parent, struct device *self, void *aux)
 free_admin_intr:
 	pci_intr_disestablish(pa->pa_pc, sc->sc_ih_admin);
 shutdown:
-	/* Quiesce the device before freeing memory it may still read. */
-	ena_dev_reset(sc, ENA_RESET_SHUTDOWN);
-	if (ENA_DMA_LEN(&sc->sc_hostinfo) != 0)
-		ena_dmamem_free(sc, &sc->sc_hostinfo);
-	ena_dmamem_free(sc, &sc->sc_mmio_resp);
+	/* Full teardown once the control plane is up; see ena_dev_fini(). */
+	ena_dev_fini(sc);
+	return;
 free_aenq:
 	ena_aenq_fini(sc);
 free_aq:
@@ -897,11 +901,27 @@ ena_detach(struct device *self, int flags)
 	ether_ifdetach(ifp);
 	if_detach(ifp);
 
+	ena_dev_fini(sc);
+
+	return (0);
+}
+
+/*
+ * The teardown mirror of ena_dev_init: quiesce the device, then release the
+ * device-global control plane in reverse of the attach allocation order -
+ * host info, mmio response, event ring, admin ring, and the BAR mappings.
+ * The one full-teardown path shared by a failed attach and by detach, so the
+ * two cannot drift.  The two guards cover the genuinely optional pieces (host
+ * info, whose allocation is non-fatal, and the LLQ BAR).
+ */
+static void
+ena_dev_fini(struct ena_softc *sc)
+{
 	ena_dev_reset(sc, ENA_RESET_SHUTDOWN);
-	ena_aenq_fini(sc);
 	if (ENA_DMA_LEN(&sc->sc_hostinfo) != 0)
 		ena_dmamem_free(sc, &sc->sc_hostinfo);
 	ena_dmamem_free(sc, &sc->sc_mmio_resp);
+	ena_aenq_fini(sc);
 	ena_aq_fini(sc);
 	if (sc->sc_llq_mems != 0) {
 		bus_space_unmap(sc->sc_llq_memt, sc->sc_llq_memh,
@@ -910,8 +930,6 @@ ena_detach(struct device *self, int flags)
 	}
 	bus_space_unmap(sc->sc_memt, sc->sc_memh, sc->sc_mems);
 	sc->sc_mems = 0;
-
-	return (0);
 }
 
 /*
@@ -947,18 +965,36 @@ ena_dev_reset(struct ena_softc *sc, int reason)
 	return (0);
 }
 
+struct ena_backoff {
+	unsigned int	eb_us;
+	unsigned int	eb_waited;
+};
+
+/*
+ * One step of the shared poll backoff: sleep the current interval and
+ * double it, or report the timeout budget spent.  The caller owns the
+ * predicate it spins on and what a timeout means for it.
+ */
+static int
+ena_backoff_step(struct ena_backoff *eb, unsigned int tmo_us)
+{
+	if (eb->eb_waited >= tmo_us)
+		return (ETIMEDOUT);
+	delay(eb->eb_us);
+	eb->eb_waited += eb->eb_us;
+	eb->eb_us = MIN(eb->eb_us * 2, ENA_POLL_MAX_US);
+	return (0);
+}
+
 static int
 ena_reset_wait(struct ena_softc *sc, uint32_t mask, uint32_t want,
     unsigned int tmo_us)
 {
-	unsigned int us = ENA_POLL_MIN_US, waited = 0;
+	struct ena_backoff eb = { ENA_POLL_MIN_US, 0 };
 
 	while ((ena_rd(sc, ENA_DEV_STS) & mask) != want) {
-		if (waited >= tmo_us)
+		if (ena_backoff_step(&eb, tmo_us) != 0)
 			return (ETIMEDOUT);
-		delay(us);
-		waited += us;
-		us = MIN(us * 2, ENA_POLL_MAX_US);
 	}
 
 	return (0);
@@ -1097,24 +1133,32 @@ ena_aq_fini(struct ena_softc *sc)
 	ena_dmamem_free(sc, &sc->sc_aq_ring);
 }
 
+/*
+ * One table for both the errno and the log string of a completion status,
+ * keyed by the status constant itself so the two can never drift from the
+ * enum the way a positional array would.
+ */
+static const struct {
+	int		err;
+	const char     *str;
+} ena_aq_status_tbl[] = {
+	[ENA_ACQ_RC_SUCCESS]		= { 0,		"success" },
+	[ENA_ACQ_RC_RESOURCE_ALLOC_FAIL] = { ENOMEM,	"resource allocation failure" },
+	[ENA_ACQ_RC_BAD_OPCODE]		= { EINVAL,	"bad opcode" },
+	[ENA_ACQ_RC_UNSUPPORTED_OPCODE]	= { EOPNOTSUPP,	"unsupported opcode" },
+	[ENA_ACQ_RC_MALFORMED_REQUEST]	= { EINVAL,	"malformed request" },
+	[ENA_ACQ_RC_ILLEGAL_PARAMETER]	= { EINVAL,	"illegal parameter" },
+	[ENA_ACQ_RC_UNKNOWN_ERROR]	= { EIO,	"unknown error" },
+	[ENA_ACQ_RC_RESOURCE_BUSY]	= { ENOMEM,	"resource busy" },
+};
+
 static int
 ena_aq_status_to_errno(uint8_t status)
 {
-	switch (status) {
-	case ENA_ACQ_RC_SUCCESS:
-		return (0);
-	case ENA_ACQ_RC_RESOURCE_ALLOC_FAIL:
-	case ENA_ACQ_RC_RESOURCE_BUSY:
-		return (ENOMEM);
-	case ENA_ACQ_RC_UNSUPPORTED_OPCODE:
-		return (EOPNOTSUPP);
-	case ENA_ACQ_RC_BAD_OPCODE:
-	case ENA_ACQ_RC_MALFORMED_REQUEST:
-	case ENA_ACQ_RC_ILLEGAL_PARAMETER:
-		return (EINVAL);
-	default:
+	if (status >= nitems(ena_aq_status_tbl) ||
+	    ena_aq_status_tbl[status].str == NULL)
 		return (EIO);
-	}
+	return (ena_aq_status_tbl[status].err);
 }
 
 static const char *
@@ -1140,23 +1184,13 @@ ena_aq_opcode_str(uint8_t opcode)
 	}
 }
 
-static const char *ena_aq_status_names[] = {
-	"success",
-	"resource allocation failure",
-	"bad opcode",
-	"unsupported opcode",
-	"malformed request",
-	"illegal parameter",
-	"unknown error",
-	"resource busy",
-};
-
 static const char *
 ena_aq_status_str(uint8_t status)
 {
-	if (status >= nitems(ena_aq_status_names))
+	if (status >= nitems(ena_aq_status_tbl) ||
+	    ena_aq_status_tbl[status].str == NULL)
 		return ("unknown");
-	return (ena_aq_status_names[status]);
+	return (ena_aq_status_tbl[status].str);
 }
 
 /*
@@ -1177,7 +1211,7 @@ ena_aq_exec(struct ena_softc *sc, union ena_aq_cmd *cmd,
 	struct ena_acq_desc *acq = ENA_DMA_KVA(&sc->sc_acq_ring);
 	union ena_aq_cmd *slot;
 	struct ena_acq_desc *comp;
-	unsigned int us = ENA_POLL_MIN_US, waited = 0;
+	struct ena_backoff eb = { ENA_POLL_MIN_US, 0 };
 	uint16_t cmdid;
 	int error;
 
@@ -1211,7 +1245,7 @@ ena_aq_exec(struct ena_softc *sc, union ena_aq_cmd *cmd,
 		    sc->sc_acq_phase)
 			break;
 
-		if (waited >= sc->sc_aq_timeout_us) {
+		if (ena_backoff_step(&eb, sc->sc_aq_timeout_us) != 0) {
 			sc->sc_aq_dead = 1;
 			sc->sc_dev_st.admin_timeouts++;
 			mtx_leave(&sc->sc_aq_mtx);
@@ -1220,9 +1254,6 @@ ena_aq_exec(struct ena_softc *sc, union ena_aq_cmd *cmd,
 			ena_reset_request(sc, ENA_RESET_ADMIN_TO);
 			return (ETIMEDOUT);
 		}
-		delay(us);
-		waited += us;
-		us = MIN(us * 2, ENA_POLL_MAX_US);
 	}
 
 	/* The phase bit is written last; order the rest after it. */
@@ -1491,8 +1522,8 @@ ena_get_queue_limits(struct ena_softc *sc)
 	if (sc->sc_max_tx_segs == 0 || sc->sc_max_tx_segs > ENA_TX_NSEGS)
 		sc->sc_max_tx_segs = ENA_TX_NSEGS;
 	/*
-	 * sc_tx_max_hdr is clamped in ena_llq_negotiate() once the
-	 * entry size, and with it the inline header space, is known.
+	 * sc_tx_max_hdr is clamped in ena_dev_init() once negotiation
+	 * has reported the LLQ entry size the inline header rides in.
 	 */
 
 	/* Absurd limits would corrupt the ring math further down. */
@@ -1530,7 +1561,6 @@ ena_dev_init(struct ena_softc *sc, int reason, uint8_t *enaddr)
 	 * ena_llq_negotiate() re-commits further down the ladder.
 	 */
 	sc->sc_llq_on = 0;
-	sc->sc_llq_meta = 0;
 	sc->sc_llq_burst = 0;
 	sc->sc_llq_entry_size = 0;
 
@@ -1552,14 +1582,41 @@ ena_dev_init(struct ena_softc *sc, int reason, uint8_t *enaddr)
 	 */
 	ena_llq_negotiate(sc);
 	tx_cap = sc->sc_max_tx_sq_depth;
-	if (sc->sc_llq_on)
+	if (sc->sc_llq_on) {
 		tx_cap = MIN(tx_cap, sc->sc_llq_max_depth);
+		/*
+		 * The inline header can be at most the LLQ entry minus its
+		 * fixed offset; a zero device hint means "use that cap".
+		 */
+		if (sc->sc_tx_max_hdr == 0 || sc->sc_tx_max_hdr >
+		    sc->sc_llq_entry_size - ENA_LLQ_HDR_OFF)
+			sc->sc_tx_max_hdr = sc->sc_llq_entry_size -
+			    ENA_LLQ_HDR_OFF;
+	}
 	sc->sc_rx_ndescs = 1U <<
 	    (fls(MIN(ENA_NDESCS_MAX, sc->sc_max_rx_sq_depth)) - 1);
 	sc->sc_tx_ndescs = 1U << (fls(MIN(ENA_NDESCS_MAX, tx_cap)) - 1);
 	sc->sc_rx_buf_len = MCLBYTES;
 
 	return (ena_aenq_negotiate(sc));
+}
+
+/*
+ * How many LLQ entries a packet of ndescs descriptors needs: the first
+ * ENA_LLQ_DESCS_BEFORE_HDR descriptors ride in the head entry next to the
+ * inline header, the rest spill into continuation entries of descs_entry
+ * descriptors each.  Both the negotiate-time burst-budget check and the
+ * TX-path doorbell pre-check size a packet through here, so the admission
+ * bound and the runtime bound cannot drift apart.
+ */
+static inline unsigned int
+ena_llq_entries_needed(unsigned int ndescs, unsigned int descs_entry)
+{
+	unsigned int need = 1;
+
+	if (ndescs > ENA_LLQ_DESCS_BEFORE_HDR)
+		need += howmany(ndescs - ENA_LLQ_DESCS_BEFORE_HDR, descs_entry);
+	return (need);
 }
 
 /*
@@ -1574,10 +1631,9 @@ static void
 ena_llq_negotiate(struct ena_softc *sc)
 {
 	struct ena_feat_llq llq, set;
-	unsigned int esize;
+	unsigned int esize, burst;
 	uint32_t depth;
 	uint16_t esize_bit, accel;
-	int meta;
 
 	/*
 	 * The LLQ state was already invalidated at the reset; it is
@@ -1639,16 +1695,34 @@ ena_llq_negotiate(struct ena_softc *sc)
 		return;
 
 	/*
-	 * DISABLE_META_CACHING is the one accel mode we must honor: the
-	 * device keeps no meta descriptor across packets, so each packet
-	 * carries its own or the device transmits every frame against a
-	 * stale meta and drops it before the wire.  LIMIT_TX_BURST is left
-	 * off deliberately - enabling it puts the device into a burst read
-	 * mode where a single pushed entry makes it walk on through the
-	 * ring, so the burst budget stays disabled and doorbells are free.
+	 * Both accel modes are required, not optional, so this driver only
+	 * ever runs the accelerated LLQ path and the TX code needs no
+	 * per-packet mode checks.  DISABLE_META_CACHING: the device caches
+	 * no meta descriptor across packets, so ena_tx_submit_llq() puts one
+	 * on every packet.  LIMIT_TX_BURST: the device accepts at most
+	 * max_tx_burst_size bytes of entries between doorbells, so the TX
+	 * path rings the doorbell before a packet would exceed the remaining
+	 * budget (kept in entries, bytes / entry size).  Nitro v5+ makes
+	 * both mandatory; every Nitro v4+ instance advertises them.  A device
+	 * that offers neither cannot drive this path, so decline LLQ and let
+	 * host placement (still accepted before Nitro v5) carry TX.
 	 */
 	accel = lemtoh16(&llq.efl_accel_flags);
-	meta = ISSET(accel, ENA_LLQ_ACCEL_DISABLE_META_CACHING) ? 1 : 0;
+	if (!ISSET(accel, ENA_LLQ_ACCEL_DISABLE_META_CACHING) ||
+	    !ISSET(accel, ENA_LLQ_ACCEL_LIMIT_TX_BURST))
+		return;
+	/*
+	 * The budget must cover a whole packet, or the pre-check in
+	 * ena_tx_submit_llq() cannot keep txr_burst_left from underflowing:
+	 * the same entries-per-packet count, here for the worst case of a meta
+	 * descriptor plus ENA_TX_NSEGS DMA segments.  That is 2 today; a device
+	 * reporting less is unusable, and a real max_tx_burst_size is hundreds
+	 * of entries.
+	 */
+	burst = lemtoh16(&llq.efl_accel_burst) / esize;
+	if (burst < ena_llq_entries_needed(1 + ENA_TX_NSEGS,
+	    esize / sizeof(struct ena_tx_desc)))
+		return;
 
 	/*
 	 * The SET carries only the driver's choices, everything else zero:
@@ -1661,20 +1735,28 @@ ena_llq_negotiate(struct ena_softc *sc)
 	htolem16(&set.efl_descs_before_hdr_enabled,
 	    ENA_LLQ_TWO_DESCS_BEFORE_HDR);
 	htolem16(&set.efl_stride_enabled, ENA_LLQ_STRIDE_MULTIPLE);
-	htolem16(&set.efl_accel_flags, ENA_LLQ_ACCEL_DISABLE_META_CACHING);
+	/*
+	 * Both accel flags, unconditionally, as the reference drivers do:
+	 * Nitro v5+ rejects the SET without the full contract, and the burst
+	 * budget it implies is honored on the TX path (see above).
+	 */
+	htolem16(&set.efl_accel_flags, ENA_LLQ_ACCEL_DISABLE_META_CACHING |
+	    ENA_LLQ_ACCEL_LIMIT_TX_BURST);
 
-	if (ena_aq_set_feature(sc, ENA_FEAT_LLQ, 1, &set, sizeof(set)) != 0)
+	/*
+	 * feature_version 1 on the GET is how the device reports the v1
+	 * fields (entry_size_recommended, max_wide_llq_depth).  The SET
+	 * version is immaterial to the device - it accepts either, verified
+	 * both ways - and the reference drivers disagree: Linux and FreeBSD
+	 * (ena-com) send the SET at 0, illumos at 1.  We follow ena-com.
+	 */
+	if (ena_aq_set_feature(sc, ENA_FEAT_LLQ, 0, &set, sizeof(set)) != 0)
 		return;
 
 	/* The caller folds this entry cap into the TX ring depth. */
 	sc->sc_llq_max_depth = depth;
 	sc->sc_llq_entry_size = esize;
-	sc->sc_llq_meta = meta;
-	sc->sc_llq_burst = 0;
-	/* Zero from the device means "no hint"; the entry is the cap. */
-	if (sc->sc_tx_max_hdr == 0 ||
-	    sc->sc_tx_max_hdr > esize - ENA_LLQ_HDR_OFF)
-		sc->sc_tx_max_hdr = esize - ENA_LLQ_HDR_OFF;
+	sc->sc_llq_burst = burst;
 	sc->sc_llq_on = 1;
 }
 
@@ -2347,6 +2429,10 @@ ena_rxr_init(struct ena_softc *sc, struct ena_rxr *rxr)
 static void
 ena_rxr_deinit(struct ena_softc *sc, struct ena_rxr *rxr)
 {
+	/*
+	 * Posted RX buffers are drained in ena_rxr_free(): deinit owns the
+	 * device queues, free owns the host memory that backs the slots.
+	 */
 	ena_kstat_destroy(&rxr->rxr_kstat);
 
 	/* If the admin queue died these fail quietly; reset cleans up. */
@@ -2472,7 +2558,11 @@ ena_rxeof(struct ena_rxr *rxr)
 		if (((status & ENA_RXC_PHASE) != 0) != rxr->rxr_cq_phase)
 			break;
 
-		/* The phase bit is written last; order the rest after. */
+		/*
+		 * The phase bit is written last; order the rest after.  The
+		 * completion-integrity checks below mirror ena_txeof(); keep
+		 * the two in sync.
+		 */
 		membar_consumer();
 
 		if (ISSET(sc->sc_capabilities, ENA_CAP_CDESC_MBZ) &&
@@ -2692,26 +2782,23 @@ ena_txr_deinit(struct ena_softc *sc, struct ena_txr *txr)
 }
 
 static int
-ena_load_mbuf(bus_dma_tag_t dmat, bus_dmamap_t map, struct mbuf *m,
-    int *defragged)
+ena_load_mbuf(struct ena_txr *txr, bus_dmamap_t map, struct mbuf *m)
 {
-	*defragged = 0;
+	bus_dma_tag_t dmat = txr->txr_sc->sc_dmat;
+	int error;
 
-	switch (bus_dmamap_load_mbuf(dmat, map, m,
-	    BUS_DMA_STREAMING | BUS_DMA_NOWAIT)) {
-	case 0:
-		return (0);
-	case EFBIG:
+	error = bus_dmamap_load_mbuf(dmat, map, m,
+	    BUS_DMA_STREAMING | BUS_DMA_NOWAIT);
+	if (error == EFBIG) {
 		/* Too many segments; collapse and retry once. */
-		*defragged = 1;
-		if (m_defrag(m, M_DONTWAIT) == 0 &&
-		    bus_dmamap_load_mbuf(dmat, map, m,
-		    BUS_DMA_STREAMING | BUS_DMA_NOWAIT) == 0)
-			return (0);
-		break;
+		txr->txr_st.defrags++;
+		if (m_defrag(m, M_DONTWAIT) == 0)
+			error = bus_dmamap_load_mbuf(dmat, map, m,
+			    BUS_DMA_STREAMING | BUS_DMA_NOWAIT);
 	}
-
-	return (1);
+	if (error != 0)
+		txr->txr_st.dma_map_err++;
+	return (error);
 }
 
 /* The 16-bit req_id is split across the two TX control words. */
@@ -2813,26 +2900,19 @@ ena_tx_submit_llq(struct ena_txr *txr, struct ena_tx_slot *slot)
 	uint16_t req_id = slot - txr->txr_slots;
 	uint64_t addr;
 	unsigned int units = 0, di = 0, cap = ENA_LLQ_DESCS_BEFORE_HDR;
-	unsigned int push, skip, seglen, ndescs, need;
+	unsigned int push, skip, seglen;
 	int i;
 
 	/*
-	 * Doorbells may only happen on packet boundaries, so make sure
-	 * the whole packet fits into the remaining burst budget before
-	 * writing anything.  dm_nsegs overestimates the descriptor
-	 * count when the pushed header swallows whole segments, which
-	 * errs on the safe side.
+	 * A doorbell may only fall on a packet boundary, so ring it now if
+	 * this whole packet would overrun the remaining burst budget; the
+	 * device accepts only so many entries between doorbells.  The meta
+	 * descriptor is the first entry, the DMA segments the rest; dm_nsegs
+	 * overestimates when the pushed header swallows segments, erring safe.
 	 */
-	if (sc->sc_llq_burst != 0) {
-		ndescs = (sc->sc_llq_meta ? 1 : 0) + map->dm_nsegs;
-		need = 1;
-		if (ndescs > ENA_LLQ_DESCS_BEFORE_HDR) {
-			need += howmany(ndescs - ENA_LLQ_DESCS_BEFORE_HDR,
-			    descs_entry);
-		}
-		if (txr->txr_burst_left < need)
-			ena_tx_kick(txr);
-	}
+	if (txr->txr_burst_left <
+	    ena_llq_entries_needed(1 + map->dm_nsegs, descs_entry))
+		ena_tx_kick_llq(txr);
 
 	memset(entry, 0, sizeof(entry));
 
@@ -2840,15 +2920,13 @@ ena_tx_submit_llq(struct ena_txr *txr, struct ena_tx_slot *slot)
 	push = MIN(m->m_pkthdr.len, sc->sc_tx_max_hdr);
 	m_copydata(m, 0, push, (caddr_t)entry + ENA_LLQ_HDR_OFF);
 
-	if (sc->sc_llq_meta) {
-		txd = &descs[di++];
-		len_ctrl = ENA_TXD_META_DESC | ENA_TXM_EXT_VALID |
-		    ENA_TXM_ETH_META_TYPE | ENA_TXM_META_STORE |
-		    ENA_TXD_FIRST;
-		if (txr->txr_sq_phase)
-			len_ctrl |= ENA_TXD_PHASE;
-		htolem32(&txd->etd_len_ctrl, len_ctrl);
-	}
+	/* Every packet carries its own meta descriptor (no meta caching). */
+	txd = &descs[di++];
+	len_ctrl = ENA_TXD_META_DESC | ENA_TXM_EXT_VALID |
+	    ENA_TXM_ETH_META_TYPE | ENA_TXM_META_STORE | ENA_TXD_FIRST;
+	if (txr->txr_sq_phase)
+		len_ctrl |= ENA_TXD_PHASE;
+	htolem32(&txd->etd_len_ctrl, len_ctrl);
 
 	/*
 	 * The first data descriptor covers the first chunk of payload
@@ -2871,8 +2949,7 @@ ena_tx_submit_llq(struct ena_txr *txr, struct ena_tx_slot *slot)
 
 	txd = &descs[di++];
 	len_ctrl = (seglen & ENA_TXD_LEN_MASK) | ENA_TXD_COMP_REQ;
-	if (!sc->sc_llq_meta)
-		len_ctrl |= ENA_TXD_FIRST;
+	/* FIRST is on the meta descriptor, so never on this data one. */
 	if (txr->txr_sq_phase)
 		len_ctrl |= ENA_TXD_PHASE;
 	meta_ctrl = 0;
@@ -2914,33 +2991,54 @@ ena_tx_submit_llq(struct ena_txr *txr, struct ena_tx_slot *slot)
 	ena_llq_flush(txr, entry);
 	units++;
 
-	if (sc->sc_llq_burst != 0)
-		txr->txr_burst_left -= units;
+	txr->txr_burst_left -= units;
 
 	return (units);
 }
 
-/*
- * The other half of the submission seam: publish what the adapters
- * wrote.  For LLQ the membar orders the entry stores into the
- * write-combining window before the doorbell reaches the device; for
- * host mode the sync plays that role for the descriptor ring.  Every
- * doorbell refills the LLQ burst budget.
- */
+/* Ring the SQ doorbell: the common tail of both publish adapters. */
 static void
-ena_tx_kick(struct ena_txr *txr)
+ena_tx_doorbell(struct ena_txr *txr)
 {
 	struct ena_softc *sc = txr->txr_sc;
-
-	if (sc->sc_llq_on) {
-		membar_producer();
-		txr->txr_burst_left = sc->sc_llq_burst;
-	} else
-		ENA_DMA_SYNC(sc, &txr->txr_sq_ring, BUS_DMASYNC_PREWRITE);
 
 	ena_wr(sc, txr->txr_db_off, txr->txr_prod);
 	txr->txr_st.doorbells++;
 }
+
+/*
+ * The publish half of the submission seam, host mode: sync the descriptor
+ * ring in RAM before the doorbell reaches the device.
+ */
+static void
+ena_tx_kick_host(struct ena_txr *txr)
+{
+	ENA_DMA_SYNC(txr->txr_sc, &txr->txr_sq_ring, BUS_DMASYNC_PREWRITE);
+	ena_tx_doorbell(txr);
+}
+
+/*
+ * The publish half, LLQ: the membar orders the entry stores into the
+ * write-combining window ahead of the doorbell, and the burst budget is
+ * refilled here because a doorbell always falls on a packet boundary.
+ */
+static void
+ena_tx_kick_llq(struct ena_txr *txr)
+{
+	membar_producer();
+	txr->txr_burst_left = txr->txr_sc->sc_llq_burst;
+	ena_tx_doorbell(txr);
+}
+
+static const struct ena_tx_ops ena_tx_ops_host = {
+	.txo_submit = ena_tx_submit_host,
+	.txo_kick = ena_tx_kick_host,
+};
+
+static const struct ena_tx_ops ena_tx_ops_llq = {
+	.txo_submit = ena_tx_submit_llq,
+	.txo_kick = ena_tx_kick_llq,
+};
 
 static void
 ena_start(struct ifqueue *ifq)
@@ -2951,7 +3049,6 @@ ena_start(struct ifqueue *ifq)
 	struct ena_tx_slot *slot;
 	struct mbuf *m;
 	unsigned int free, post = 0;
-	int rv, defragged;
 
 	if (!LINK_STATE_IS_UP(ifp->if_link_state)) {
 		ifq_purge(ifq);
@@ -2961,7 +3058,7 @@ ena_start(struct ifqueue *ifq)
 	/*
 	 * The host SQ ring is producer-only (completions land in the
 	 * separate CQ ring), so it needs no POSTWRITE reclaim here;
-	 * the PREWRITE before the doorbell lives in ena_tx_kick().
+	 * the PREWRITE before the doorbell lives in ena_tx_kick_host().
 	 */
 	for (;;) {
 		/* One spare slot distinguishes a full ring from empty. */
@@ -2990,11 +3087,7 @@ ena_start(struct ifqueue *ifq)
 		if (m == NULL)
 			break;
 
-		rv = ena_load_mbuf(sc->sc_dmat, slot->ets_map, m, &defragged);
-		if (defragged)
-			txr->txr_st.defrags++;
-		if (rv != 0) {
-			txr->txr_st.dma_map_err++;
+		if (ena_load_mbuf(txr, slot->ets_map, m) != 0) {
 			ifq->ifq_errors++;
 			m_freem(m);
 			continue;
@@ -3009,7 +3102,7 @@ ena_start(struct ifqueue *ifq)
 		    slot->ets_map->dm_mapsize, BUS_DMASYNC_PREWRITE);
 
 		slot->ets_m = m;
-		slot->ets_ndescs = (*sc->sc_tx_submit)(txr, slot);
+		slot->ets_ndescs = sc->sc_tx_ops->txo_submit(txr, slot);
 		atomic_add_int(&txr->txr_used, slot->ets_ndescs);
 		txr->txr_st.packets++;
 		txr->txr_st.bytes += m->m_pkthdr.len;
@@ -3017,7 +3110,7 @@ ena_start(struct ifqueue *ifq)
 	}
 
 	if (post)
-		ena_tx_kick(txr);
+		sc->sc_tx_ops->txo_kick(txr);
 }
 
 static void
@@ -3040,7 +3133,11 @@ ena_txeof(struct ena_txr *txr)
 		if ((txc->etc_flags & ENA_TXC_F_PHASE) != txr->txr_cq_phase)
 			break;
 
-		/* The phase bit is written last; order the rest after. */
+		/*
+		 * The phase bit is written last; order the rest after.  The
+		 * completion-integrity checks below mirror ena_rxeof(); keep
+		 * the two in sync.
+		 */
 		membar_consumer();
 
 		if (ISSET(sc->sc_capabilities, ENA_CAP_CDESC_MBZ) &&
@@ -3149,8 +3246,7 @@ ena_up(struct ena_softc *sc)
 
 	sc->sc_rxr = rxr;
 	sc->sc_txr = txr;
-	sc->sc_tx_submit = sc->sc_llq_on ?
-	    ena_tx_submit_llq : ena_tx_submit_host;
+	sc->sc_tx_ops = sc->sc_llq_on ? &ena_tx_ops_llq : &ena_tx_ops_host;
 
 	sc->sc_keepalive_ts = getuptime();
 	/* Re-baseline the device drop delta; a reset zeroed the counters. */
