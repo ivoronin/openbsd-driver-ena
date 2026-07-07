@@ -523,7 +523,8 @@ ena_wr_base(struct ena_softc *sc, bus_size_t lo, bus_addr_t dva)
 static int	ena_match(struct device *, void *, void *);
 static void	ena_attach(struct device *, struct device *, void *);
 static int	ena_detach(struct device *, int);
-static int	ena_msix_bar_assign(struct pci_attach_args *);
+static const char *
+		ena_msix_bar_assign(struct pci_attach_args *);
 
 static int	ena_dev_reset(struct ena_softc *, int);
 static int	ena_reset_wait(struct ena_softc *, uint32_t, uint32_t,
@@ -651,7 +652,7 @@ ena_match(struct device *parent, void *match, void *aux)
  * lost.  arm64 closes this gap in _pci_intr_map_msix(); this helper
  * closes it for amd64 and duplicates harmlessly elsewhere.
  */
-static int
+static const char *
 ena_msix_bar_assign(struct pci_attach_args *pa)
 {
 	pci_chipset_tag_t pc = pa->pa_pc;
@@ -667,17 +668,20 @@ ena_msix_bar_assign(struct pci_attach_args *pa)
 	 * never use it.
 	 */
 	if (!ISSET(pa->pa_flags, PCI_FLAGS_MSI_ENABLED))
-		return (ENXIO);
+		return ("MSI disabled on PCI bus");
 
 	if (pci_get_capability(pc, tag, PCI_CAP_MSIX, &off, NULL) == 0)
-		return (ENXIO);
+		return ("no MSI-X capability");
 
 	table = pci_conf_read(pc, tag, off + PCI_MSIX_TABLE);
 	bir = table & PCI_MSIX_TABLE_BIR;
 	bar = PCI_MAPREG_START + bir * 4;
 	type = pci_mapreg_type(pc, tag, bar);
 
-	return (pci_mapreg_assign(pa, bar, type, NULL, NULL));
+	if (pci_mapreg_assign(pa, bar, type, NULL, NULL) != 0)
+		return ("unable to assign MSI-X table BAR");
+
+	return (NULL);
 }
 
 static void
@@ -687,7 +691,7 @@ ena_attach(struct device *parent, struct device *self, void *aux)
 	struct pci_attach_args *pa = aux;
 	struct ifnet *ifp = &sc->sc_ac.ac_if;
 	pci_intr_handle_t ih;
-	const char *intrstr;
+	const char *errstr, *intrstr;
 	pcireg_t memtype;
 	uint8_t enaddr[ETHER_ADDR_LEN];
 	uint32_t ver, caps;
@@ -733,8 +737,9 @@ ena_attach(struct device *parent, struct device *self, void *aux)
 		sc->sc_llq_mems = 0;
 
 	/* ENA is MSI-X only; make sure the vector table BAR is backed. */
-	if (ena_msix_bar_assign(pa) != 0) {
-		printf(": unable to assign MSI-X table BAR\n");
+	errstr = ena_msix_bar_assign(pa);
+	if (errstr != NULL) {
+		printf(": %s\n", errstr);
 		goto unmap;
 	}
 
